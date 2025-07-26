@@ -1,0 +1,60 @@
+{
+    "add_bos_token": false,
+    "add_eos_token": false,
+    "add_prefix_space": true,
+    "added_tokens_decoder": {
+        "0": {
+            "content": "<|pad|>",
+            "lstrip": false,
+            "normalized": false,
+            "rstrip": false,
+            "single_word": false,
+            "special": true
+        },
+        "1": {
+            "content": "<|startoftext|>",
+            "lstrip": false,
+            "normalized": false,
+            "rstrip": false,
+            "single_word": false,
+            "special": true
+        },
+        "2": {
+            "content": "<|endoftext|>",
+            "lstrip": false,
+            "normalized": false,
+            "rstrip": false,
+            "single_word": false,
+            "special": true
+        },
+        "3": {
+            "content": "<|separation|>",
+            "lstrip": false,
+            "normalized": false,
+            "rstrip": false,
+            "single_word": false,
+            "special": true
+        },
+        "4": {
+            "content": "<|unkown|>",
+            "lstrip": false,
+            "normalized": false,
+            "rstrip": false,
+            "single_word": false,
+            "special": true
+        }
+    },
+    "additional_special_tokens": [],
+    "bos_token": "<|startoftext|>",
+    "clean_up_tokenization_spaces": false,
+    "eos_token": "<|endoftext|>",
+    "legacy": true,
+    "model_max_length": 1000000000000000019884624838656,
+    "pad_token": null,
+    "sp_model_kwargs": {},
+    "spaces_between_special_tokens": false,
+    "tokenizer_class": "PreTrainedTokenizerFast",
+    "unk_token": "<|unkown|>",
+    "use_default_system_prompt": false,
+    "chat_template": "{% if messages[0]['role'] == 'system' %}{% set system_message = messages[0]['content'] %}{% endif %}{% if system_message is defined %}{{ system_message }}{% endif %}{% for message in messages %}{% set content = message['content'] %}{% if message['role'] == 'user' %}{{ '<|startoftext|>user\\n' + content + '<|endoftext|>\\n<|startoftext|>assistant\\n' }}{% elif message['role'] == 'assistant' %}{{ content + '<|endoftext|>' + '\\n' }}{% endif %}{% endfor %}"
+}
