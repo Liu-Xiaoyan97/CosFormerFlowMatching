@@ -1,0 +1,3 @@
+[submodule "thirdparty/flow_mathing"]
+	path = thirdparty/flow_mathing
+	url = https://github.com/facebookresearch/flow_matching.git
