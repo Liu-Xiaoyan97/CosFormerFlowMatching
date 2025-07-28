@@ -5,7 +5,8 @@ from utils import (
     load_training_args_from_yaml, 
     MyDataCollator, 
     MyDataset, 
-    DetailedLoggingCallback
+    MyTrainer,
+    DetailedProgressCallback
 )
 
 
@@ -19,13 +20,13 @@ if __name__ == "__main__":
     test_dataset = MyDataset(tokenizer_path="Tokenizer_32768_v1", dataset_name="stanfordnlp/imdb", split="test", chunk_size=512)
     training_args = load_training_args_from_yaml("config/trainingargs.yml")
     
-    trainer = Trainer(
+    trainer = MyTrainer(
         model=model,
         args=training_args,
         data_collator=data_collator,
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
-        callbacks=[DetailedLoggingCallback()],
+        callbacks=[DetailedProgressCallback()],
     )
 
     # 7. 开始训练

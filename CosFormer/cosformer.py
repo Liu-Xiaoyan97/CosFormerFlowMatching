@@ -607,7 +607,6 @@ class LLFMCosformerForFlowMatching(LLFMCosformerModelBase, GenerationMixin):
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         timesteps: Optional[torch.FloatTensor] = None, 
-        c: Optional[torch.Tensor] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         *args, **kwargs
@@ -638,8 +637,8 @@ class LLFMCosformerForFlowMatching(LLFMCosformerModelBase, GenerationMixin):
 
         if timesteps is None:
             raise ValueError("timesteps must be provided for flow matching forward pass.")
-
-        c = F.silu(self.time_embedding(timesteps)) 
+        # print(f"------->{timesteps.dtype}")
+        c = F.silu(self.time_embedding(timesteps.float())) 
 
         for block in self.flow_blocks:
             hidden_states, = block(
@@ -653,19 +652,7 @@ class LLFMCosformerForFlowMatching(LLFMCosformerModelBase, GenerationMixin):
 
 
         logits = self.flow_output_layer(x=hidden_states, c=c) # Shape: (B, S, Vocab_Size)
-        if labels is not None:
-            valid_label_mask = (labels != -100).float()
-            safe_labels = labels.clone()
-            safe_labels[safe_labels == -100] = 0
-            one_hot_labels = F.one_hot(safe_labels, num_classes=self.vocab_size).float()
-            one_hot_labels = one_hot_labels * valid_label_mask.unsqueeze(-1)
-            masked_logits = logits * valid_label_mask.unsqueeze(-1)
-            masked_one_hot_labels = one_hot_labels * valid_label_mask.unsqueeze(-1)
-            mse_loss = F.mse_loss(masked_logits, masked_one_hot_labels, reduction='none')
-            mse_loss = mse_loss.sum(dim=-1)
-            total_valid_positions = valid_label_mask.sum() + 1e-8 # Add small epsilon to avoid division by zero
-            loss = mse_loss.sum() / total_valid_positions
-
+        loss = None
         if not return_dict:
             outputs = (logits,) + outputs[1:] 
             return ((loss,) + outputs) if loss is not None else outputs
@@ -675,5 +662,4 @@ class LLFMCosformerForFlowMatching(LLFMCosformerModelBase, GenerationMixin):
             logits=logits,
             past_key_values=past_key_values,
             hidden_states=hidden_states,
-            
         )

@@ -1,6 +1,7 @@
 from .utils import (
     load_training_args_from_yaml,
-    DetailedLoggingCallback,
+    DetailedProgressCallback,
     MyDataCollator,
-    MyDataset
+    MyDataset,
+    MyTrainer,
 )

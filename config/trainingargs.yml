@@ -2,8 +2,8 @@ training_args:
   output_dir: "./llm_cosformer_results"
   overwrite_output_dir: true
   num_train_epochs: 3
-  per_device_train_batch_size: 64
-  per_device_eval_batch_size: 64
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
   warmup_steps: 300
   learning_rate: 1e-4
   lr_scheduler_type: "cosine"
@@ -21,3 +21,12 @@ training_args:
   save_steps: 100
   eval_steps: 100
   eval_strategy: "steps"
+  bf16: false
+  bf16_full_eval: false
+  
+trainer_args:
+  source_distribution: uniform  
+  loss_function: cross_entropy  
+  exponent: 1.
+  scheduler_type: polynomial
+  sampling_steps: 1024
