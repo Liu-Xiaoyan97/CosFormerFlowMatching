@@ -4,4 +4,5 @@ from .utils import (
     MyDataCollator,
     MyDataset,
     MyTrainer,
+    FlowMatchingUtils
 )

@@ -1,32 +1,76 @@
+# Flow Matching Training Configuration
+trainer_args:
+  # Flow matching specific parameters
+  scheduler_type: "polynomial"
+  exponent: 2.0
+  loss_function: "cross_entropy"  # or "cross_entropy"
+  source_distribution: "mask"  # or "uniform"
+  time_epsilon: 1e-3
+
+# Training Arguments
 training_args:
   output_dir: "./llm_cosformer_results"
   overwrite_output_dir: true
+  
+  # Training parameters
   num_train_epochs: 3
-  per_device_train_batch_size: 2
+  per_device_train_batch_size: 2  # Adjust based on your GPU memory
   per_device_eval_batch_size: 2
-  warmup_steps: 300
-  learning_rate: 1e-4
-  lr_scheduler_type: "cosine"
-  logging_steps: 10
+  gradient_accumulation_steps: 8  # Effective batch size = 2 * 8 = 16
+  
+  # Learning rate and optimization
+  learning_rate: 5e-5
+  weight_decay: 0.01
+  warmup_steps: 1000
+  max_grad_norm: 1.0
+  
+  # Evaluation and saving
+  eval_strategy: "steps"
+  eval_steps: 1000
+  save_steps: 1000
   save_total_limit: 3
   load_best_model_at_end: true
   metric_for_best_model: "eval_loss"
   greater_is_better: false
-  data_seed: 1
-  ignore_data_skip: true
-  prediction_loss_only: true
-  remove_unused_columns: false
-  dataloader_pin_memory: false
-  use_cpu: true
-  save_steps: 100
-  eval_steps: 100
-  eval_strategy: "steps"
-  bf16: false
-  bf16_full_eval: false
   
-trainer_args:
-  source_distribution: uniform  
-  loss_function: cross_entropy  
-  exponent: 1.
-  scheduler_type: polynomial
-  sampling_steps: 1024
+  # Logging
+  logging_steps: 100
+  logging_dir: "./logs"
+  report_to: null  # Disable wandb/tensorboard by default
+  
+  # Memory optimization
+  fp16: false
+  gradient_checkpointing: true
+  dataloader_pin_memory: true
+  dataloader_num_workers: 2
+  
+  # Other settings
+  remove_unused_columns: false  # Important for flow matching
+  prediction_loss_only: true
+  
+# Model Configuration (these will override defaults in the model config)
+model_config:
+  hidden_size: 512
+  intermediate_size: 1024
+  num_hidden_layers: 12
+  num_attention_heads: 8
+  num_key_value_heads: 8
+  max_position_embeddings: 4096
+  vocab_size: 32768
+  
+  # Flow matching specific
+  flow_matching:
+    timestep_emb_dim: 256
+    cond_dim: 512  # Should match hidden_size
+    n_blocks: 6
+    n_heads: 8
+    mlp_ratio: 4
+    dropout: 0.1
+
+# Dataset Configuration
+dataset_config:
+  tokenizer_path: "Tokenizer_32768_v1"
+  dataset_name: "stanfordnlp/imdb"
+  chunk_size: 512
+  max_train_samples: null  # null for all samples
+  max_eval_samples: 1000

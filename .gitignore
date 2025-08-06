@@ -120,6 +120,7 @@ cython_debug/
 
 # 训练日志
 llm_cosformer_results/
+logs/
 
 # 数据
 stanfordnlp/

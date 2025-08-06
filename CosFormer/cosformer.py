@@ -12,7 +12,7 @@ from torch import Tensor
 from typing import Optional, Tuple
 from torch import nn
 from transformers import GradientCheckpointingLayer
-from transformers.cache_utils import Cache
+from transformers.cache_utils import Cache, DynamicCache
 from transformers.activations import ACT2FN
 from transformers.utils import auto_docstring, can_return_tuple
 from transformers.masking_utils import create_causal_mask
@@ -31,7 +31,9 @@ from CosFormer.configuration_LLMFCosformer import LLMFCosformerConfig
 def bias_dropout_add_scale(
     x: Tensor, scale: Tensor, residual: Optional[Tensor], prob: float, training: bool
 ) -> Tensor:
-    return residual + scale * F.dropout(x, p=prob, training=training)
+    if training and prob > 0:
+        x = F.dropout(x, p=prob, training=training)
+    return residual + scale * x
 
 
 def modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
@@ -47,7 +49,6 @@ class LayerNorm(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         with torch.amp.autocast("cuda", enabled=False):
             x = F.layer_norm(x.float(), [self.dim])
-
         return x * self.weight[None, None, :]
 
 
@@ -69,7 +70,7 @@ class TimestepEmbedder(nn.Module):
     def timestep_embedding(time: Tensor, dim: int, max_period: int = 10000) -> Tensor:
         """
         Create sinusoidal timestep embeddings.
-        :param t: a 1-D Tensor of N indices, one per batch element.
+        :param time: a 1-D Tensor of N indices, one per batch element.
                           These may be fractional.
         :param dim: the dimension of the output.
         :param max_period: controls the minimum frequency of the embeddings.
@@ -90,6 +91,8 @@ class TimestepEmbedder(nn.Module):
         return embedding
 
     def forward(self, time: Tensor) -> Tensor:
+        # Ensure time is detached to avoid gradient issues
+        time = time.detach()
         t_freq = self.timestep_embedding(time=time, dim=self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb
@@ -112,24 +115,35 @@ class CosformerAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.act_fun = ACT2FN[config.hidden_act]
         # q, k, v projection
-        self.k_proj = nn.Linear(self.kdim, config.hidden_size)
-        self.v_proj = nn.Linear(self.vdim, config.hidden_size)
-        self.q_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.k_proj = nn.Linear(self.kdim, config.hidden_size, bias=config.attention_bias)
+        self.v_proj = nn.Linear(self.vdim, config.hidden_size, bias=config.attention_bias)
+        self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attention_bias)
         # outprojection
-        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attention_bias)
         # dropout rate
         self.dropout_rate = config.attention_dropout
         # causal
         self.causal = False
         self.has_outproj = True
+        
+        # Pre-compute max index size to avoid dynamic parameter creation
+        self.max_seq_len = config.max_position_embeddings
+        self._precompute_indices()
 
         assert (self.embed_dim % self.num_heads == 0), "embed_dim must be divisible by num_heads"
 
+    def _precompute_indices(self):
+        """Pre-compute indices for all possible sequence lengths"""
+        max_index = np.pi / 2 * torch.arange(1, self.max_seq_len + 1).reshape(1, -1, 1)
+        self.register_buffer('precomputed_index', max_index, persistent=False)
+
     def get_index(self, seq_len):
-        index = np.pi / 2 * torch.arange(1, seq_len + 1).reshape(1, -1, 1)
-
-        return nn.Parameter(index, requires_grad=False)
-
+        """Get pre-computed index for given sequence length"""
+        if seq_len > self.max_seq_len:
+            # Dynamically compute for longer sequences (rare case)
+            index = np.pi / 2 * torch.arange(1, seq_len + 1).reshape(1, -1, 1)
+            return index.to(self.precomputed_index.device)
+        return self.precomputed_index[:, :seq_len, :]
 
     def forward(
         self,
@@ -150,9 +164,9 @@ class CosformerAttention(nn.Module):
             attn_mask (Optional[Tensor], optional): typically used to implement causal attention, 
             where the mask prevents the attention from looking forward in time (default: None).
         """
-        if key == None:
+        if key is None:
             key = query
-        if value == None:
+        if value is None:
             value = query
         
         num_heads = self.num_heads
@@ -182,12 +196,14 @@ class CosformerAttention(nn.Module):
         
         # cos transform
         m = max(src_len, tgt_len)
-        # get index and send to cuda
-        weight_index = self.get_index(m).to(q)
+        # get index - now using pre-computed buffer
+        weight_index = self.get_index(m)
         # (N * h, L, 2 * d)
-        q_ = torch.cat([q * torch.sin(weight_index[:, :tgt_len, :] / m), q * torch.cos(weight_index[:, :tgt_len, :] / m)], dim=-1)
+        q_ = torch.cat([q * torch.sin(weight_index[:, :tgt_len, :] / m), 
+                       q * torch.cos(weight_index[:, :tgt_len, :] / m)], dim=-1)
         # (N * h, S, 2 * d)
-        k_ = torch.cat([k * torch.sin(weight_index[:, :src_len, :] / m), k * torch.cos(weight_index[:, :src_len, :] / m)], dim=-1)
+        k_ = torch.cat([k * torch.sin(weight_index[:, :src_len, :] / m), 
+                       k * torch.cos(weight_index[:, :src_len, :] / m)], dim=-1)
 
         if self.causal:
             ## Need to improve speed!
@@ -214,89 +230,13 @@ class CosformerAttention(nn.Module):
             attn_output = torch.einsum('nld,ndm,nl->nlm', q_, kv_, z_)
             # (N * h, L, d) -> (L, N * h, d) -> (L, N, E)
             attn_output = attn_output.transpose(0, 1).contiguous().view(tgt_len, bsz, -1)
+        
         # L, N, E
         if self.has_outproj:
             attn_output = self.out_proj(attn_output)
 
         return attn_output
 
-    def left_product(
-        self,
-        query: Tensor,
-        key: Optional[Tensor] = None,
-        value: Optional[Tensor] = None,
-        attn_mask: Optional[Tensor] = None,
-        eps: Optional[float] = 1e-6,
-    ):
-        """Input shape: Sequence x Batch x Embedding
-        Args:
-            query (Tensor): `(L, N, E)` where L is the target sequence length, N is the batch size,
-            E is the embedding dimension.
-            key (Tensor): `(S, N, E)` where S is the source sequence length, N is the batch size,
-            E is the embedding dimension.
-            value (Tensor): `(S, N, E)` where S is the source sequence length, N is the batch size,
-            E is the embedding dimension.
-            attn_mask (Optional[Tensor], optional): typically used to implement causal attention, 
-            where the mask prevents the attention from looking forward in time (default: None).
-        """
-        # test for the correctness of the program
-        if key == None:
-            key = query
-        if value == None:
-            value = query
-        
-        num_heads = self.num_heads
-        tgt_len, bsz, embed_dim = query.size()
-        src_len = key.size(0)
-        head_dim = embed_dim // num_heads
-
-        # get q, k, v
-        # (L, N, E)
-        q = self.q_proj(query)
-        # (S, N, E)
-        k = self.k_proj(key)
-        # (S, N, E)
-        v = self.v_proj(value)
-
-        # activation
-        q = self.act_fun(q)
-        k = self.act_fun(k)
-
-        # multihead reshape
-        # (N * h, L, d)
-        q = q.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
-        # (N * h, S, d)
-        k = k.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
-        # (N * h, S, d)
-        v = v.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
-        
-        # cos transform
-        m = max(src_len, tgt_len)
-        # get index and send to cuda
-        weight_index = self.get_index(m).to(q)
-        # (N * h, L, 2 * d)
-        q_ = torch.cat([q * torch.sin(weight_index[:, :tgt_len, :] / m), q * torch.cos(weight_index[:, :tgt_len, :] / m)], dim=-1)
-        # (N * h, S, 2 * d)
-        k_ = torch.cat([k * torch.sin(weight_index[:, :src_len, :] / m), k * torch.cos(weight_index[:, :src_len, :] / m)], dim=-1)
-
-        # (N * h, L, d) (N * h, d, S) -> (N * h, L, S)
-        weights = torch.bmm(q_, k_.transpose(1, 2))
-        # mask
-        if self.causal:
-            weights = weights.masked_fill(attn_mask==float("-inf"), 0)
-        # (N * h, L, S) -> (N * h, L, S)
-        denom = torch.clamp_min(weights.sum(dim=-1, keepdim=True), eps)
-        # (N * h, L, S) (N * h, L, S) -> (N * h, L, S)
-        attn_weights = weights / denom
-        # (N * h, L, S) (N * h, S, d) -> (N * h, L, d)
-        attn_output = torch.bmm(attn_weights, v)
-        # (N * h, L, d) -> (L, N * h, d) -> (L, N, E)
-        attn_output = attn_output.transpose(0, 1).contiguous().view(tgt_len, bsz, -1)
-        # L, N, E
-        if self.has_outproj:
-            attn_output = self.out_proj(attn_output)
-
-        return attn_output
 
 class SmolLM3RMSNorm(nn.Module):
     """
@@ -340,12 +280,12 @@ class SmolLM3MLP(nn.Module):
         return down_proj
 
 
-class CosformerDDiTBlock(GradientCheckpointingLayer):
+class CosformerDDiTBlock(nn.Module):  # Removed GradientCheckpointingLayer inheritance
     def __init__(self, config: "LLMFCosformerConfig", layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.n_heads = config.num_attention_heads
-        self.cond_dim = config.hidden_size
+        self.cond_dim = config.flow_matching.get('cond_dim', config.hidden_size)
         self.dropout = config.attention_dropout
         self.mlp_ratio = 4 
         self.layer_idx = layer_idx
@@ -388,7 +328,8 @@ class CosformerDDiTBlock(GradientCheckpointingLayer):
         if c is None:
             raise ValueError("Conditioning tensor 'c' must be provided for CosformerDDiTBlock.")
 
-        modulation_params = self.adaLN_modulation(c)
+        # Ensure c is detached to avoid gradient accumulation issues
+        modulation_params = self.adaLN_modulation(c.detach())
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
             modulation_params.chunk(6, dim=1)
         shift_msa = shift_msa.unsqueeze(1) # [B, 1, D]
@@ -450,8 +391,8 @@ class SmolLM3RotaryEmbedding(nn.Module):
         self.original_inv_freq = self.inv_freq
 
     @torch.no_grad()
-    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
+        # Use no_grad to ensure no gradient computation
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
 
@@ -485,14 +426,15 @@ class DDitFinalLayer(nn.Module):
 
         # 使用与主干相同的 RMSNorm
         self.norm_final = SmolLM3RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.linear = nn.Linear(hidden_size, out_channels)
+        self.linear = nn.Linear(hidden_size, out_channels, bias=False)
 
         # Adaptive Layer Normalization modulation
         self.adaLN_modulation = nn.Linear(cond_dim, 2 * hidden_size, bias=True)
         nn.init.zeros_(self.adaLN_modulation.weight)
         nn.init.zeros_(self.adaLN_modulation.bias)
         nn.init.zeros_(self.linear.weight)
-        nn.init.zeros_(self.linear.bias)
+        if self.linear.bias is not None:
+            nn.init.zeros_(self.linear.bias)
 
     def forward(self, x: Tensor, c: Tensor) -> Tensor:
         """
@@ -506,7 +448,8 @@ class DDitFinalLayer(nn.Module):
             Tensor: Output logits of shape [B, S, Out_Channels].
         """
         batch_size = x.shape[0]
-        modulation_params = self.adaLN_modulation(c)
+        # Detach c to avoid gradient issues
+        modulation_params = self.adaLN_modulation(c.detach())
         shift, scale = modulation_params.chunk(2, dim=1) 
         shift = shift.unsqueeze(1) # [B, 1, D]
         scale = scale.unsqueeze(1) # [B, 1, D]
@@ -516,10 +459,11 @@ class DDitFinalLayer(nn.Module):
 
         return logits
 
+
 class LLFMCosformerModelBase(PreTrainedModel):
     config_class = LLMFCosformerConfig
     base_model_prefix = "model"
-    supports_gradient_checkpointing = True
+    supports_gradient_checkpointing = False  # Disable gradient checkpointing
     _no_split_modules = ["CosformerDDiTBlock"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn_2 = True
@@ -547,12 +491,21 @@ class LLFMCosformerModelBase(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
         elif isinstance(module, SmolLM3RMSNorm):
             module.weight.data.fill_(1.0)
+    
+    def gradient_checkpointing_enable(self, **kwargs):
+        """Override to prevent gradient checkpointing from being enabled"""
+        pass
+    
+    def gradient_checkpointing_disable(self):
+        """Override to ensure gradient checkpointing is disabled"""
+        self.gradient_checkpointing = False
 
 
 class LLFMCosformerForFlowMatching(LLFMCosformerModelBase, GenerationMixin):
     def __init__(self, config: LLMFCosformerConfig, masked: bool = False):
         super().__init__(config)
         self.vocab_size = config.vocab_size
+        self.masked = masked
 
         flow_config = getattr(config, 'flow_matching', {})
         self.timestep_emb_dim = flow_config.get('timestep_emb_dim', 256)
@@ -560,13 +513,17 @@ class LLFMCosformerForFlowMatching(LLFMCosformerModelBase, GenerationMixin):
         self.flow_n_blocks = flow_config.get('n_blocks', 4)
         self.flow_n_heads = flow_config.get('n_heads', config.num_attention_heads)
         self.flow_mlp_ratio = flow_config.get('mlp_ratio', 4)
-        self.flow_dropout = flow_config.get('dropout', config.attention_dropout) # 使用 attention_dropout 作为默认
+        self.flow_dropout = flow_config.get('dropout', config.attention_dropout)
 
-        self.time_embedding = TimestepEmbedder(hidden_size=self.cond_dim, frequency_embedding_size=self.timestep_emb_dim)
+        self.time_embedding = TimestepEmbedder(
+            hidden_size=self.cond_dim, 
+            frequency_embedding_size=self.timestep_emb_dim
+        )
+        
         add_token = 1 if masked else 0
-
         self.vocab_embed = nn.Embedding(self.vocab_size + add_token, config.hidden_size)
         self.rotary_emb = SmolLM3RotaryEmbedding(config=config)
+        
         self.flow_blocks = nn.ModuleList([
             CosformerDDiTBlock(
                 config=config,
@@ -580,22 +537,18 @@ class LLFMCosformerForFlowMatching(LLFMCosformerModelBase, GenerationMixin):
             cond_dim=self.cond_dim,
             rms_norm_eps=config.rms_norm_eps, 
         )
-        # ------------------
 
+        # Disable gradient checkpointing
+        self.gradient_checkpointing = False
+        
         self.post_init()
 
     def get_input_embeddings(self):
-        return self.model.embed_tokens
+        return self.vocab_embed
 
     def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
+        self.vocab_embed = value
 
-    def set_decoder(self, decoder):
-        self.model = decoder
-
-    def get_decoder(self):
-        return self.model
-    
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -609,16 +562,27 @@ class LLFMCosformerForFlowMatching(LLFMCosformerModelBase, GenerationMixin):
         timesteps: Optional[torch.FloatTensor] = None, 
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        *args, **kwargs
+        **kwargs
     ) -> Union[CausalLMOutputWithPast, Tuple]:
 
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        if (input_ids is None) ^ (inputs_embeds is not None):
+        
+        # Input validation
+        if (input_ids is None) and (inputs_embeds is None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+        
+        if timesteps is None:
+            raise ValueError("timesteps must be provided for flow matching forward pass.")
+
+        # Ensure timesteps are detached
+        timesteps = timesteps.detach() if timesteps.requires_grad else timesteps
+
+        # Get embeddings
         if inputs_embeds is None:
             inputs_embeds = self.vocab_embed(input_ids)
+
+        # Cache setup
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache()
         if cache_position is None:
@@ -629,37 +593,56 @@ class LLFMCosformerForFlowMatching(LLFMCosformerModelBase, GenerationMixin):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
+        # Main forward pass
         hidden_states = inputs_embeds
-        causal_mask_mapping = {"full_attention": attention_mask} 
         all_hidden_states = () if output_hidden_states else None
+        
+        # Position embeddings with no_grad to avoid gradient issues
+        with torch.no_grad():
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # Timestep conditioning - ensure it's computed fresh
+        c = self.time_embedding(timesteps.float())
+        # Stop gradients from flowing back through c
+        c = c.detach()
 
-        if timesteps is None:
-            raise ValueError("timesteps must be provided for flow matching forward pass.")
-        # print(f"------->{timesteps.dtype}")
-        c = F.silu(self.time_embedding(timesteps.float())) 
-
+        # Process through flow blocks
         for block in self.flow_blocks:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+                
             hidden_states, = block(
                 hidden_states,
                 attention_mask=attention_mask,
                 c=c,
                 position_embeddings=position_embeddings,
                 position_ids=position_ids, 
-                past_key_value=None, use_cache=False, cache_position=None # Flow matching 通常不使用 cache
+                past_key_value=None, 
+                use_cache=False, 
+                cache_position=None
             )
 
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
 
+        # Final output layer
         logits = self.flow_output_layer(x=hidden_states, c=c) # Shape: (B, S, Vocab_Size)
+        
         loss = None
+        if labels is not None:
+            # For flow matching, we typically don't compute standard cross-entropy loss here
+            # The loss computation should be handled by the flow matching loss function
+            pass
+
         if not return_dict:
-            outputs = (logits,) + outputs[1:] 
+            outputs = (logits,)
+            if output_hidden_states:
+                outputs += (all_hidden_states,)
             return ((loss,) + outputs) if loss is not None else outputs
 
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=past_key_values,
-            hidden_states=hidden_states,
+            hidden_states=all_hidden_states,
         )

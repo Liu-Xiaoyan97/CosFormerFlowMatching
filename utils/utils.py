@@ -1,315 +1,345 @@
 import torch
-from torch.utils.data import IterableDataset
-from transformers import AutoTokenizer, TrainerCallback, Trainer, TrainingArguments
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+from transformers import (
+    AutoTokenizer, 
+    TrainingArguments, 
+    Trainer,
+    TrainerCallback
+)
+from transformers.trainer_utils import EvalPrediction
 from datasets import load_dataset
-from typing import Optional, Dict, List, Any, Union
-from dataclasses import dataclass
-from tqdm import tqdm
 from omegaconf import OmegaConf
-from transformers.modeling_outputs import CausalLMOutputWithPast
-from evalution.logic.flow import get_source_distribution, get_path
+from typing import Dict, Any, List, Optional, Union
+import numpy as np
 from flow_matching.loss import MixturePathGeneralizedKL
-from contextlib import nullcontext
-import torch.nn as nn
-from flow_matching.path import ProbPath
-from omegaconf import OmegaConf
-import math
-from CosFormer.configuration_LLMFCosformer import LLMFCosformerConfig
+from flow_matching.path import MixtureDiscreteProbPath
+from flow_matching.path.scheduler import PolynomialConvexScheduler
+from evalution.logic.flow import get_path, get_loss_function, get_source_distribution
 
-
-class Colors:
-    RED = '\033[91m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    BLUE = '\033[94m'
-    MAGENTA = '\033[95m'
-    CYAN = '\033[96m'
-    WHITE = '\033[97m'
-    ENDC = '\033[0m'
-
-class DetailedProgressCallback(TrainerCallback):
-    """
-    自定义进度条回调，在训练过程中显示详细的指标
-    """
-    def __init__(self):
-        super().__init__()
-        self.training_bar = None
-        self.prediction_bar = None
-        self.current_step = 0
-
-    def on_train_begin(self, args, state, control, **kwargs):
-        if state.is_local_process_zero:
-            # 计算总步数
-            total_train_steps = state.max_steps
-            if total_train_steps <= 0:
-                # 如果 max_steps 不可用，使用 num_train_epochs 计算
-                num_update_steps_per_epoch = len(kwargs['train_dataloader']) // args.gradient_accumulation_steps
-                total_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-                
-            self.training_bar = tqdm(
-                total=total_train_steps,
-                desc=f"{Colors.BLUE}Training{Colors.ENDC}",
-                colour="blue",
-                ncols=100,
-                leave=True
-            )
-
-    def on_step_end(self, args, state, control, **kwargs):
-        if state.is_local_process_zero and self.training_bar is not None:
-            self.current_step += 1
-            self.training_bar.update(1)
-            # 获取最新的训练日志
-            logs = state.log_history[-1] if state.log_history else {}
-            
-            # 提取指标
-            loss = logs.get("loss", float('inf'))
-            learning_rate = logs.get("learning_rate", 0)
-            epoch = logs.get("epoch", 0)
-            perplexity = math.exp(loss) if loss < 20 else float('inf') 
-            
-            # 准备显示的指标字典
-            postfix_dict = {
-                "loss": f"{loss:.4f}",
-                "ppl": f"{perplexity:.2f}",
-                "lr": f"{learning_rate:.2e}",
-                "epoch": f"{epoch:.2f}"
-            }
-            
-            # 如果有验证结果，也显示
-            for i in range(len(state.log_history) - 1, -1, -1):
-                log = state.log_history[i]
-                if "eval_loss" in log:
-                    eval_loss = log["eval_loss"]
-                    try:
-                        eval_ppl = math.exp(eval_loss) if eval_loss < 20 else float('inf')
-                    except:
-                        eval_ppl = float('inf')
-                    postfix_dict["eval_loss"] = f"{eval_loss:.4f}"
-                    postfix_dict["eval_ppl"] = f"{eval_ppl:.2f}"
-                    break
-            
-            self.training_bar.set_postfix(postfix_dict)
+class MyDataset(Dataset):
+    """Dataset for flow matching training"""
     
-    def on_evaluate(self, args, state, control, **kwargs):
-        if state.is_local_process_zero and self.training_bar is not None:
-            # 获取最新的评估日志
-            logs = state.log_history[-1] if state.log_history else {}
-            eval_loss = logs.get("eval_loss", float('inf'))
-
-            eval_ppl = math.exp(eval_loss) if eval_loss < 20 else float('inf')
-            
-            # 更新进度条
-            current_postfix = self.training_bar.format_dict.get('postfix', {})
-            if isinstance(current_postfix, str):
-                current_postfix = {}
-            elif current_postfix is None:
-                current_postfix = {}
-                
-            current_postfix.update({
-                "eval_loss": f"{eval_loss:.4f}",
-                "eval_ppl": f"{eval_ppl:.2f}"
-            })
-            self.training_bar.set_postfix(current_postfix)
-            
-            # 打印独立的评估信息
-            epoch_str = f" Epoch: {state.epoch:.2f}" if state.epoch is not None else ""
-            print(f"\nEval{epoch_str} Step: {state.global_step} - "
-                  f"Eval Loss: {eval_loss:.4f} - "
-                  f"Eval Perplexity: {eval_ppl:.2f}")
-
-    def on_train_end(self, args, state, control, **kwargs):
-        if state.is_local_process_zero and self.training_bar is not None:
-            self.training_bar.close()
-            self.training_bar = None
-
-    def on_prediction_step(self, args, state, control, eval_dataloader=None, **kwargs):
-        if state.is_local_process_zero:
-            if self.prediction_bar is None:
-                self.prediction_bar = tqdm(
-                    total=len(eval_dataloader),
-                    desc=f"{Colors.YELLOW}Evaluating{Colors.ENDC}",
-                    leave=False,
-                    colour="yellow",
-                    ncols=100
-                )
-            self.prediction_bar.update(1)
-
-    def on_predict(self, args, state, control, metrics, **kwargs):
-        if state.is_local_process_zero and self.prediction_bar is not None:
-            self.prediction_bar.close()
-            self.prediction_bar = None
-            
-            
-class MyDataset(IterableDataset):
-    def __init__(self, 
-                 tokenizer_path: str = "Tokenizer_32768_v1", 
-                 dataset_name: str = "stanfordnlp/imdb",
-                 split: str = "train",
-                 chunk_size: int = 8):
-        self.data = load_dataset(dataset_name, split=split)
+    def __init__(
+        self, 
+        tokenizer_path: str, 
+        dataset_name: str, 
+        split: str, 
+        chunk_size: int = 512,
+        max_samples: Optional[int] = None
+    ):
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        if self.tokenizer.bos_token_id is None:
-            raise ValueError("Tokenizer must have a bos_token_id")
-        if self.tokenizer.eos_token_id is None:
-            raise ValueError("Tokenizer must have an eos_token_id")
-        if self.tokenizer.pad_token_id is None:
-            self.tokenizer.pad_token_id = 0
-            
-        self.buffer = []
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        
         self.chunk_size = chunk_size
-
-    def __len__(self):
-        return int(1e9)
+        
+        # Load dataset
+        raw_dataset = load_dataset(dataset_name, split=split)
+        if max_samples is not None:
+            raw_dataset = raw_dataset.select(range(min(max_samples, len(raw_dataset))))
+        
+        # Process dataset
+        self.data = self._process_dataset(raw_dataset)
     
-    def __iter__(self):
-        for example in self.data:
-            input_ids = self.tokenizer(example['text'], return_attention_mask=False)["input_ids"]
-            self.buffer.extend(input_ids)
-            
-            while len(self.buffer) >= self.chunk_size - 1:
-
-                model_input_ids = [self.tokenizer.bos_token_id] + self.buffer[:self.chunk_size-1]
-
-                targets = self.buffer[:self.chunk_size-1] + [self.tokenizer.eos_token_id]
-                
-                yield {
-                    "input_ids": model_input_ids,
-                    "labels": targets
-                }
-
-                self.buffer = self.buffer[self.chunk_size-1:]
+    def _process_dataset(self, raw_dataset):
+        """Process raw dataset into tokenized chunks"""
+        processed_data = []
         
-
-        if len(self.buffer) > 0:
-            num_real_tokens = len(self.buffer)
-            num_pad_tokens_input = self.chunk_size - 1 - num_real_tokens
-            num_pad_tokens_labels = self.chunk_size - 2 - num_real_tokens 
-
-            model_input_ids = [self.tokenizer.pad_token_id] * num_pad_tokens_input + \
-                              [self.tokenizer.bos_token_id] + self.buffer
-                              
-            targets = [-100] * num_pad_tokens_labels + \
-                      [self.tokenizer.bos_token_id] + self.buffer + [self.tokenizer.eos_token_id]
+        for item in raw_dataset:
+            if 'text' in item:
+                text = item['text']
+            elif 'review' in item:  # For IMDB dataset
+                text = item['review']
+            else:
+                continue
             
-            yield {
-                "input_ids": model_input_ids,
-                "labels": targets
-            }
-            self.buffer = []
+            # Tokenize text
+            tokens = self.tokenizer(
+                text,
+                truncation=False,
+                add_special_tokens=True,
+                return_tensors="pt"
+            )['input_ids'].squeeze(0)
             
-def sample_timesteps(batch_size, device, method='uniform'):
-    """采样时间步 t"""
-    if method == 'uniform':
-        eps = 1e-5
-        return torch.rand(batch_size, device=device) * (1 - eps) + eps
-    else:
-        raise NotImplementedError
-
-@dataclass
-class MyDataCollator:
-    """
-    数据整理器，将一批样本整理成模型需要的格式。
-    """
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        input_ids = [feature["input_ids"] for feature in features]
-        labels = [feature["labels"] for feature in features]
-
-        batch_input_ids = torch.tensor(input_ids, dtype=torch.long)
-        batch_labels = torch.tensor(labels, dtype=torch.long)
+            # Split into chunks
+            for i in range(0, len(tokens) - self.chunk_size + 1, self.chunk_size):
+                chunk = tokens[i:i + self.chunk_size]
+                if len(chunk) == self.chunk_size:
+                    processed_data.append(chunk)
         
-        attention_mask = (batch_input_ids != 0).long()
-
+        return processed_data
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
         return {
-            "input_ids": batch_input_ids,
-            "attention_mask": attention_mask,
-            "labels": batch_labels,
-            "timesteps": sample_timesteps(batch_input_ids.shape[0], batch_input_ids.device)
+            'input_ids': self.data[idx],
+            'labels': self.data[idx].clone()  # For flow matching, labels are the same as input
         }
 
-def load_training_args_from_yaml(config_path: str) -> TrainingArguments:
-    """
-    从 YAML 文件加载配置并创建 TrainingArguments
-    """
-    cfg = OmegaConf.load(config_path)
-    training_args_dict = OmegaConf.to_container(cfg.training_args, resolve=True)
-    training_args = TrainingArguments(**training_args_dict)
-    return training_args
 
-def get_loss_function(loss_function: str, path: Optional[ProbPath] = None):
-    if loss_function == "cross_entropy":
-        return nn.CrossEntropyLoss(ignore_index=-100)
-    elif loss_function == "generalized_kl":
-        assert path is not None
-        return MixturePathGeneralizedKL(path)
-    else:
-        raise ValueError(f"Unknown loss function: {loss_function}")
+class MyDataCollator:
+    """Data collator for flow matching training"""
     
+    def __init__(self, pad_token_id: int = 0):
+        self.pad_token_id = pad_token_id
     
+    def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        batch_size = len(features)
+        
+        # Stack input_ids and labels
+        input_ids = torch.stack([f['input_ids'] for f in features])
+        labels = torch.stack([f['labels'] for f in features])
+        
+        # Create attention mask (all 1s since we're using fixed-length sequences)
+        attention_mask = torch.ones_like(input_ids)
+        
+        return {
+            'input_ids': input_ids,
+            'labels': labels,
+            'attention_mask': attention_mask,
+        }
+
+
 class MyTrainer(Trainer):
+    """Custom trainer for flow matching training"""
+    
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        flow_cfg = OmegaConf.load("config/trainingargs.yml")
-        self.flow_cfg = OmegaConf.to_container(flow_cfg.trainer_args, resolve=True)
-        config = LLMFCosformerConfig()
-        self.source_distribution = get_source_distribution(source_distribution=self.flow_cfg["source_distribution"], vocab_size=config.vocab_size)
-        self.path = get_path(scheduler_type=self.flow_cfg["scheduler_type"], exponent=self.flow_cfg["exponent"])
         
-    def training_step(self, model: nn.Module, inputs: dict[str, Union[torch.Tensor, Any]], num_items_in_batch: Optional[torch.Tensor] = None) -> torch.Tensor:
-        model.train()
-        inputs = self._prepare_inputs(inputs)
-        if self.args.gradient_accumulation_steps > 1:
-            loss = self.compute_loss(model, inputs) / self.args.gradient_accumulation_steps
-        else:
-            loss = self.compute_loss(model, inputs)
+        # Load flow matching configuration
+        try:
+            flow_cfg = OmegaConf.load("config/trainingargs.yml").trainer_args
+        except:
+            # Default configuration if file doesn't exist
+            flow_cfg = OmegaConf.create({
+                'scheduler_type': 'polynomial',
+                'exponent': 2.0,
+                'loss_function': 'generalized_kl',
+                'source_distribution': 'mask',
+                'time_epsilon': 1e-3
+            })
         
-        if self.args.gradient_checkpointing:
-            self.accelerator.backward(loss)
-        else:
-            loss.backward()
+        self.flow_cfg = flow_cfg
         
-        return loss.detach()
-
-    def compute_loss(self, model: nn.Module, inputs: dict[str, Union[torch.Tensor, Any]], return_outputs: bool = False, num_items_in_batch: Optional[torch.Tensor] = None):
-        loss_fct = get_loss_function(self.flow_cfg["loss_function"], self.path)
-        time_epsilon = 1e-3 if isinstance(loss_fct, MixturePathGeneralizedKL) else 0.0
-        x_1 = inputs["input_ids"]
+        # Initialize flow matching components
+        self.path = get_path(
+            scheduler_type=flow_cfg.scheduler_type, 
+            exponent=flow_cfg.get('exponent', 2.0)
+        )
+        
+        self.loss_fn = get_loss_function(
+            loss_function=flow_cfg.loss_function, 
+            path=self.path
+        )
+        
+        self.time_epsilon = (
+            flow_cfg.get('time_epsilon', 1e-3) 
+            if isinstance(self.loss_fn, MixturePathGeneralizedKL) 
+            else 0.0
+        )
+        
+        # Get vocab size from model
+        vocab_size = self.model.vocab_size
+        self.source_distribution = get_source_distribution(
+            source_distribution=flow_cfg.source_distribution,
+            vocab_size=vocab_size
+        )
+    
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """
+        Compute the loss for flow matching.
+        Override the default compute_loss to implement flow matching loss.
+        """
+        device = inputs['input_ids'].device
+        x_1 = inputs['input_ids']
+        batch_size, seq_len = x_1.shape
+        
+        # Sample timesteps and prepare flow matching inputs
+        # Everything here must be detached from any previous computation graph
         with torch.no_grad():
+            t = torch.rand(batch_size, device=device) * (1.0 - self.time_epsilon)
             x_0 = self.source_distribution.sample_like(x_1)
-            t = torch.rand(x_1.shape[0], device=x_1.device)*(1.0 - time_epsilon)
-            path_sample = self.path.sample(t=t, x_0 = x_0, x_1 = x_1)
             
-        ctx = nullcontext() if self.args.gradient_checkpointing else torch.enable_grad()
-        with ctx:
-            inputs["input_ids"] = path_sample.x_t
-            inputs["timesteps"] = path_sample.t
-            outputs = model(**inputs)
+            # Ensure x_0 and x_1 are completely detached
+            x_0 = x_0.detach().clone()
+            x_1_detached = x_1.detach().clone()
             
-            if isinstance(outputs, dict) and "loss" in outputs:
-                loss = outputs["loss"]
-            elif hasattr(outputs, "loss") and outputs.loss is not None:
-                loss = outputs.loss
-            else:
-                logits = outputs.get("logits")
-                labels = inputs.get("labels")
-                if isinstance(loss_fct, nn.CrossEntropyLoss):
-                    loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
-                elif isinstance(loss_fct, MixturePathGeneralizedKL):
-                    loss = loss_fct(logits=logits, x_1 = inputs["input_ids"], x_t = path_sample.x_t, t=path_sample.t).mean()
-                else:
-                    raise ValueError("Invalid loss function")
-            
+            # Sample from path
+            path_sample = self.path.sample(t=t, x_0=x_0, x_1=x_1_detached)
+            x_t = path_sample.x_t.detach().clone()
+            timesteps = t.detach().clone()
+        
+        # Now create fresh tensors that require grad if needed
+        x_t = x_t.requires_grad_(False)  # Input doesn't need grad
+        timesteps = timesteps.requires_grad_(False)  # Timesteps don't need grad
+        
+        # Forward pass through model
+        outputs = model(
+            input_ids=x_t,
+            timesteps=timesteps,
+            attention_mask=inputs.get('attention_mask'),
+            return_dict=True
+        )
+        logits = outputs.logits
+        
+        # Compute loss - ensure x_1 is the original tensor with potential gradients
+        if isinstance(self.loss_fn, MixturePathGeneralizedKL):
+            loss = self.loss_fn(
+                logits=logits,
+                x_1=x_1,  # Use original x_1, not detached version
+                x_t=x_t,
+                t=timesteps
+            )
+        else:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                x_1.view(-1),
+                ignore_index=-100
+            )
+        
         return (loss, outputs) if return_outputs else loss
     
-    def prediction_step(self, model: nn.Module, inputs: dict[str, Union[torch.Tensor, Any]], prediction_loss_only: bool, ignore_keys: Optional[list[str]] = None) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        inputs = self._prepare_inputs(inputs)
-        with torch.no_grad():
-            loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
-            loss = loss.mean().detach()
-            
-            if prediction_loss_only:
-                return (loss, None, None)
-            logits = outputs.get("logits")
-            labels = inputs.get("labels")
-            
-            return (loss, logits, labels)
+
+
+class DetailedProgressCallback(TrainerCallback):
+    """Callback to show detailed training progress"""
     
+    def __init__(self):
+        self.step_count = 0
+    
+    def on_log(self, args, state, control, model=None, logs=None, **kwargs):
+        """Called when logging occurs"""
+        if logs:
+            print(f"Step {state.global_step}: {logs}")
+    
+    def on_train_step_end(self, args, state, control, model=None, **kwargs):
+        """Called at the end of each training step"""
+        self.step_count += 1
+        if self.step_count % 100 == 0:
+            print(f"Completed {self.step_count} training steps")
+    
+    def on_epoch_end(self, args, state, control, model=None, **kwargs):
+        """Called at the end of each epoch"""
+        print(f"Completed epoch {state.epoch}")
+    
+    def on_evaluate(self, args, state, control, model=None, logs=None, **kwargs):
+        """Called during evaluation"""
+        if logs:
+            print(f"Evaluation results: {logs}")
+
+
+def load_training_args_from_yaml(yaml_path: str) -> TrainingArguments:
+    """Load training arguments from YAML configuration file"""
+    
+    try:
+        config = OmegaConf.load(yaml_path)
+        training_args = config.get('training_args', {})
+    except:
+        print(f"Warning: Could not load {yaml_path}, using default arguments")
+        training_args = {}
+    
+    # Default training arguments optimized for flow matching
+    default_args = {
+        'output_dir': './llm_cosformer_results',
+        'overwrite_output_dir': True,
+        'num_train_epochs': 3,
+        'per_device_train_batch_size': 4,
+        'per_device_eval_batch_size': 4,
+        'gradient_accumulation_steps': 4,
+        'eval_strategy': 'steps',
+        'eval_steps': 500,
+        'save_steps': 500,
+        'save_total_limit': 3,
+        'learning_rate': 5e-5,
+        'weight_decay': 0.01,
+        'warmup_steps': 500,
+        'logging_steps': 100,
+        'logging_dir': './logs',
+        'dataloader_num_workers': 0,
+        'remove_unused_columns': False,  # Important for flow matching
+        'load_best_model_at_end': True,
+        'metric_for_best_model': 'eval_loss',
+        'greater_is_better': False,
+        'report_to': None,  # Disable wandb/tensorboard by default
+        'fp16': False,  # Disable mixed precision to avoid conflicts
+        'gradient_checkpointing': False,  # Disable to avoid conflicts
+        'dataloader_pin_memory': True,
+        'ddp_find_unused_parameters': False,  # Avoid DDP issues
+    }
+    
+    # Merge with user-provided arguments
+    final_args = {**default_args, **training_args}
+    
+    return TrainingArguments(**final_args)
+
+
+def compute_metrics(eval_pred: EvalPrediction) -> Dict[str, float]:
+    """
+    Compute metrics for evaluation (placeholder for flow matching)
+    """
+    # For flow matching, standard metrics like accuracy don't apply
+    # We mainly rely on the loss value
+    return {}
+
+
+class FlowMatchingUtils:
+    """Utility functions for flow matching"""
+    
+    @staticmethod
+    def sample_timesteps(batch_size: int, device: torch.device, epsilon: float = 1e-3) -> torch.Tensor:
+        """Sample random timesteps for training"""
+        return torch.rand(batch_size, device=device) * (1.0 - epsilon)
+    
+    @staticmethod
+    def prepare_flow_matching_batch(
+        x_1: torch.Tensor,
+        source_distribution,
+        path,
+        t: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """Prepare a batch for flow matching training"""
+        
+        with torch.no_grad():
+            # Sample from source distribution
+            x_0 = source_distribution.sample_like(x_1)
+            
+            # Sample x_t from the path
+            path_sample = path.sample(t=t, x_0=x_0, x_1=x_1)
+            x_t = path_sample.x_t.detach().clone()
+        
+        return {
+            'x_0': x_0.detach(),
+            'x_t': x_t,
+            'x_1': x_1,
+            't': t.detach()
+        }
+    
+    @staticmethod
+    def validate_config(config: Dict[str, Any]) -> bool:
+        """Validate flow matching configuration"""
+        required_keys = ['scheduler_type', 'loss_function', 'source_distribution']
+        
+        for key in required_keys:
+            if key not in config:
+                print(f"Warning: Missing required config key: {key}")
+                return False
+        
+        valid_schedulers = ['polynomial']
+        if config['scheduler_type'] not in valid_schedulers:
+            print(f"Warning: Invalid scheduler_type: {config['scheduler_type']}")
+            return False
+        
+        valid_losses = ['generalized_kl', 'cross_entropy']
+        if config['loss_function'] not in valid_losses:
+            print(f"Warning: Invalid loss_function: {config['loss_function']}")
+            return False
+        
+        valid_distributions = ['mask', 'uniform']
+        if config['source_distribution'] not in valid_distributions:
+            print(f"Warning: Invalid source_distribution: {config['source_distribution']}")
+            return False
+        
+        return True
