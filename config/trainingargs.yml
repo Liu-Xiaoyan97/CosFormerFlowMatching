@@ -3,7 +3,7 @@ trainer_args:
   # Flow matching specific parameters
   scheduler_type: "polynomial"
   exponent: 2.0
-  loss_function: "cross_entropy"  # or "cross_entropy"
+  loss_function: "generalized_kl"  # or "cross_entropy"
   source_distribution: "mask"  # or "uniform"
   time_epsilon: 1e-3
 
@@ -11,12 +11,12 @@ trainer_args:
 training_args:
   output_dir: "./llm_cosformer_results"
   overwrite_output_dir: true
-  
+  max_steps: 1000000000
   # Training parameters
-  num_train_epochs: 3
-  per_device_train_batch_size: 2  # Adjust based on your GPU memory
-  per_device_eval_batch_size: 2
-  gradient_accumulation_steps: 8  # Effective batch size = 2 * 8 = 16
+  num_train_epochs: 1
+  per_device_train_batch_size: 8  # Adjust based on your GPU memory
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 8  # Effective batch size = 8 * 8 = 64
   
   # Learning rate and optimization
   learning_rate: 5e-5
@@ -40,37 +40,34 @@ training_args:
   
   # Memory optimization
   fp16: false
-  gradient_checkpointing: true
+  gradient_checkpointing: false  # Disabled for flow matching
   dataloader_pin_memory: true
   dataloader_num_workers: 2
   
   # Other settings
   remove_unused_columns: false  # Important for flow matching
   prediction_loss_only: true
-  
-# Model Configuration (these will override defaults in the model config)
+
+# Model Configuration
 model_config:
+  # Core model parameters
+  vocab_size: 32768
   hidden_size: 512
   intermediate_size: 1024
-  num_hidden_layers: 12
+  num_hidden_layers: 6  
   num_attention_heads: 8
   num_key_value_heads: 8
   max_position_embeddings: 4096
-  vocab_size: 32768
+  attention_dropout: 0.1
   
-  # Flow matching specific
-  flow_matching:
-    timestep_emb_dim: 256
-    cond_dim: 512  # Should match hidden_size
-    n_blocks: 6
-    n_heads: 8
-    mlp_ratio: 4
-    dropout: 0.1
+  # Flow matching specific parameters
+  timestep_emb_dim: 256
+  mlp_ratio: 4
 
 # Dataset Configuration
 dataset_config:
   tokenizer_path: "Tokenizer_32768_v1"
-  dataset_name: "stanfordnlp/imdb"
+  dataset_name: "cerebras/SlimPajama-627B"
   chunk_size: 512
   max_train_samples: null  # null for all samples
-  max_eval_samples: 1000
+  max_eval_samples: 10000

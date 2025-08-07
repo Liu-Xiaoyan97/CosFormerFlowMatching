@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset  # Added IterableDataset
 from transformers import (
     AutoTokenizer, 
     TrainingArguments, 
@@ -21,8 +21,9 @@ from collections import deque
 import wandb
 from tqdm import tqdm
 
-class MyDataset(Dataset):
-    """Dataset for flow matching training"""
+# MODIFICATION 1: Changed to inherit from IterableDataset instead of Dataset
+class MyDataset(IterableDataset):
+    """Dataset for flow matching training - now as IterableDataset"""
     
     def __init__(
         self, 
@@ -37,20 +38,51 @@ class MyDataset(Dataset):
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
         self.chunk_size = chunk_size
+        self.dataset_name = dataset_name
+        self.split = split
+        self.max_samples = max_samples
         
-        # Load dataset
-        raw_dataset = load_dataset(dataset_name, split=split)
-        if max_samples is not None:
-            raw_dataset = raw_dataset.select(range(min(max_samples, len(raw_dataset))))
-        
-        # Process dataset
-        self.data = self._process_dataset(raw_dataset)
+        # For IterableDataset, we don't load all data upfront
+        # Instead, we'll stream it in __iter__
     
-    def _process_dataset(self, raw_dataset):
-        """Process raw dataset into tokenized chunks"""
-        processed_data = []
+    def _process_text(self, text: str):
+        """Process a single text into tokenized chunks"""
+        chunks = []
         
+        # Tokenize text
+        tokens = self.tokenizer(
+            text,
+            truncation=False,
+            add_special_tokens=True,
+            return_tensors="pt"
+        )['input_ids'].squeeze(0)
+        
+        # Split into chunks
+        for i in range(0, len(tokens) - self.chunk_size + 1, self.chunk_size):
+            chunk = tokens[i:i + self.chunk_size]
+            if len(chunk) == self.chunk_size:
+                chunks.append(chunk)
+        
+        return chunks
+    
+    def __len__(self):
+        """Approximate length of the dataset"""
+        # For IterableDataset, we can't know exact size upfront
+        # Return a large number to ensure we don't run out of data
+        return 1000000000
+    
+    def __iter__(self):
+        """Iterator for streaming data"""
+        # Load dataset in streaming mode if possible
+        raw_dataset = load_dataset(self.dataset_name, split=self.split, streaming=True)
+        
+        sample_count = 0
         for item in raw_dataset:
+            # Check if we've reached max_samples
+            if self.max_samples is not None and sample_count >= self.max_samples:
+                break
+            
+            # Extract text from item
             if 'text' in item:
                 text = item['text']
             elif 'review' in item:  # For IMDB dataset
@@ -58,30 +90,20 @@ class MyDataset(Dataset):
             else:
                 continue
             
-            # Tokenize text
-            tokens = self.tokenizer(
-                text,
-                truncation=False,
-                add_special_tokens=True,
-                return_tensors="pt"
-            )['input_ids'].squeeze(0)
+            # Process text into chunks
+            chunks = self._process_text(text)
             
-            # Split into chunks
-            for i in range(0, len(tokens) - self.chunk_size + 1, self.chunk_size):
-                chunk = tokens[i:i + self.chunk_size]
-                if len(chunk) == self.chunk_size:
-                    processed_data.append(chunk)
-        
-        return processed_data
-    
-    def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, idx):
-        return {
-            'input_ids': self.data[idx],
-            'labels': self.data[idx].clone()  # For flow matching, labels are the same as input
-        }
+            # Yield each chunk
+            for chunk in chunks:
+                yield {
+                    'input_ids': chunk,
+                    'labels': chunk.clone()  # For flow matching, labels are the same as input
+                }
+                sample_count += 1
+                
+                # Check max_samples for each chunk
+                if self.max_samples is not None and sample_count >= self.max_samples:
+                    return
 
 
 class MyDataCollator:
@@ -375,8 +397,7 @@ class DetailedProgressCallback(TrainerCallback):
                 generated = self.generator.generate(
                     prefix=prefix,
                     **self.generation_config,
-                    progress_bar=False,
-                    debug=False
+                    progress_bar=True
                 )
                 
                 generation_results.append({
@@ -461,8 +482,11 @@ class DetailedProgressCallback(TrainerCallback):
         """Calculate current training metrics"""
         metrics = {}
         
-        # Calculate smoothed train loss
+        # MODIFICATION 2: Removed division by gradient_accumulation_steps
+        # The loss values in self.train_losses are already the averaged loss per batch
+        # Hugging Face Trainer already handles gradient accumulation internally
         if self.train_losses:
+            # Simply average the losses without additional division
             avg_loss = sum(self.train_losses) / len(self.train_losses)
             metrics['loss'] = f"{avg_loss:.4f}"
             # Calculate perplexity

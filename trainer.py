@@ -20,50 +20,8 @@ def main():
     # Load configuration
     config_path = "config/trainingargs.yml"
     if not os.path.exists(config_path):
-        print(f"Warning: Config file {config_path} not found. Using default configuration.")
-        # Create default config
-        os.makedirs("config", exist_ok=True)
-        with open(config_path, "w") as f:
-            f.write("""# Flow Matching Training Configuration
-trainer_args:
-  scheduler_type: "polynomial"
-  exponent: 2.0
-  loss_function: "generalized_kl"
-  source_distribution: "mask"
-  time_epsilon: 1e-3
-
-training_args:
-  output_dir: "./llm_cosformer_results"
-  overwrite_output_dir: true
-  num_train_epochs: 3
-  per_device_train_batch_size: 2
-  per_device_eval_batch_size: 2
-  gradient_accumulation_steps: 8
-  learning_rate: 5e-5
-  weight_decay: 0.01
-  warmup_steps: 1000
-  evaluation_strategy: "steps"
-  eval_steps: 1000
-  save_steps: 1000
-  save_total_limit: 3
-  logging_steps: 100
-  fp16: false
-  gradient_checkpointing: false
-  remove_unused_columns: false
-
-model_config:
-  hidden_size: 512
-  intermediate_size: 1024
-  num_hidden_layers: 12
-  num_attention_heads: 8
-  max_position_embeddings: 4096
-  vocab_size: 32768
-
-dataset_config:
-  tokenizer_path: "Tokenizer_32768_v1"
-  dataset_name: "stanfordnlp/imdb"
-  chunk_size: 512
-""")
+        print(f"Error: Config file {config_path} not found.")
+        return
     
     try:
         full_config = OmegaConf.load(config_path)
@@ -95,37 +53,28 @@ dataset_config:
         print("Please ensure the tokenizer path is correct.")
         return
     
-    # Setup model configuration
-    model_config_dict = OmegaConf.to_container(full_config.get('model_config', {}), resolve=True)
-
-    # Create model config with proper vocab size
-    config = LLMFCosformerConfig(
-        vocab_size=tokenizer.vocab_size,
-        hidden_size=model_config_dict.get('hidden_size', 512),
-        intermediate_size=model_config_dict.get('intermediate_size', 1024),
-        num_hidden_layers=model_config_dict.get('num_hidden_layers', 12),
-        num_attention_heads=model_config_dict.get('num_attention_heads', 8),
-        num_key_value_heads=model_config_dict.get('num_key_value_heads', 8),
-        max_position_embeddings=model_config_dict.get('max_position_embeddings', 4096),
-        flow_matching=model_config_dict.get('flow_matching', {
-            "timestep_emb_dim": 256,
-            "cond_dim": model_config_dict.get('hidden_size', 512),
-            "n_blocks": 6,
-            "n_heads": model_config_dict.get('num_attention_heads', 8),
-            "mlp_ratio": 4,
-            "dropout": 0.1
-        })
-    )
+    # Create model config - it will automatically load from yml
+    config = LLMFCosformerConfig()
     
-    print("Model configuration:")
+    print("Model configuration (loaded from trainingargs.yml):")
     print(f"  Vocab size: {config.vocab_size}")
     print(f"  Hidden size: {config.hidden_size}")
-    print(f"  Num layers: {config.num_hidden_layers}")
-    print(f"  Num heads: {config.num_attention_heads}")
-    print(f"  Flow matching blocks: {config.flow_matching['n_blocks']}")
+    print(f"  Intermediate size: {config.intermediate_size}")
+    print(f"  Num hidden layers (flow blocks): {config.num_hidden_layers}")
+    print(f"  Num attention heads: {config.num_attention_heads}")
+    print(f"  Num key-value heads: {config.num_key_value_heads}")
+    print(f"  Max position embeddings: {config.max_position_embeddings}")
+    print(f"  Attention dropout: {config.attention_dropout}")
+    print(f"Flow matching configuration:")
+    print(f"  Timestep embedding dim: {config.flow_matching['timestep_emb_dim']}")
+    print(f"  Conditioning dim: {config.flow_matching['cond_dim']}")
+    print(f"  Number of blocks: {config.flow_matching['n_blocks']}")
+    print(f"  Number of heads: {config.flow_matching['n_heads']}")
+    print(f"  MLP ratio: {config.flow_matching['mlp_ratio']}")
+    print(f"  Dropout: {config.flow_matching['dropout']}")
     
     # Initialize model
-    print("Initializing model...")
+    print("\nInitializing model...")
     masked = full_config.get('trainer_args', {}).get('source_distribution', 'mask') == 'mask'
     model = LLFMCosformerForFlowMatching(config, masked=masked)
     
@@ -136,9 +85,9 @@ dataset_config:
         model.gradient_checkpointing_disable()
     
     # Print model size
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
+    total_params = sum(p.numel() for p in model.parameters()) / 10e6
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad) / 10e6
+    print(f"Model parameters: {total_params:.2f}M total, {trainable_params:.2f}M trainable")
     
     # Setup data collator
     data_collator = MyDataCollator(pad_token_id=tokenizer.pad_token_id)
@@ -149,7 +98,7 @@ dataset_config:
     max_train_samples = dataset_config.get('max_train_samples', None)
     max_eval_samples = dataset_config.get('max_eval_samples', 1000)
     
-    print(f"Loading datasets from {dataset_name}...")
+    print(f"\nLoading datasets from {dataset_name}...")
     print(f"  Chunk size: {chunk_size}")
     print(f"  Max train samples: {max_train_samples if max_train_samples else 'All'}")
     print(f"  Max eval samples: {max_eval_samples if max_eval_samples else 'All'}")
@@ -171,15 +120,14 @@ dataset_config:
             max_samples=max_eval_samples
         )
         
-        print(f"Train dataset size: {len(train_dataset)}")
-        print(f"Eval dataset size: {len(eval_dataset)}")
+        print(f"Datasets loaded successfully")
         
     except Exception as e:
         print(f"Error loading datasets: {e}")
         return
     
     # Setup training arguments
-    print("Setting up training arguments...")
+    print("\nSetting up training arguments...")
     training_args = load_training_args_from_yaml(config_path)
     
     # Force disable gradient checkpointing in training args
@@ -193,11 +141,13 @@ dataset_config:
     print(f"  Gradient accumulation steps: {training_args.gradient_accumulation_steps}")
     print(f"  Effective batch size: {training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps}")
     print(f"  Learning rate: {training_args.learning_rate}")
-    print(f"  Mixed precision: {training_args.fp16}")
+    print(f"  Warmup steps: {training_args.warmup_steps}")
+    print(f"  Weight decay: {training_args.weight_decay}")
+    print(f"  Mixed precision (fp16): {training_args.fp16}")
     print(f"  Gradient checkpointing: {training_args.gradient_checkpointing}")
     
     # Create trainer
-    print("Creating trainer...")
+    print("\nCreating trainer...")
     
     # Create detailed callback with generation testing
     detailed_callback = DetailedProgressCallback(
@@ -239,7 +189,7 @@ dataset_config:
         if checkpoints:
             latest_checkpoint = max(checkpoints, key=lambda x: int(x.split('-')[1]))
             checkpoint_path = os.path.join(training_args.output_dir, latest_checkpoint)
-            print(f"Found checkpoint: {checkpoint_path}")
+            print(f"\nFound checkpoint: {checkpoint_path}")
             
             resume = input("Do you want to resume from this checkpoint? (y/n): ")
             if resume.lower() == 'y':
@@ -249,14 +199,14 @@ dataset_config:
                 print("Starting fresh training...")
                 trainer.train()
         else:
-            print("No checkpoints found. Starting fresh training...")
+            print("\nNo checkpoints found. Starting fresh training...")
             trainer.train()
     else:
-        print("Starting fresh training...")
+        print("\nStarting fresh training...")
         trainer.train()
     
     # Save final model
-    print("Saving final model...")
+    print("\nSaving final model...")
     trainer.save_model()
     
     # Save tokenizer with the model
@@ -271,7 +221,7 @@ dataset_config:
         eval_results = trainer.evaluate()
         print("Evaluation results:")
         for key, value in eval_results.items():
-            print(f"  {key}: {value}")
+            print(f"  {key}: {value:.4f}" if isinstance(value, float) else f"  {key}: {value}")
     except Exception as e:
         print(f"Evaluation failed: {e}")
     
