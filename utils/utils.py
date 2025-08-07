@@ -16,6 +16,10 @@ from flow_matching.loss import MixturePathGeneralizedKL
 from flow_matching.path import MixtureDiscreteProbPath
 from flow_matching.path.scheduler import PolynomialConvexScheduler
 from evalution.logic.flow import get_path, get_loss_function, get_source_distribution
+import math
+from collections import deque
+import wandb
+from tqdm import tqdm
 
 class MyDataset(Dataset):
     """Dataset for flow matching training"""
@@ -147,6 +151,10 @@ class MyTrainer(Trainer):
             source_distribution=flow_cfg.source_distribution,
             vocab_size=vocab_size
         )
+        
+        # Track metrics for progress bar
+        self.current_train_loss = None
+        self.current_eval_loss = None
     
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
@@ -200,35 +208,284 @@ class MyTrainer(Trainer):
                 ignore_index=-100
             )
         
+        # Update current loss for progress bar
+        if model.training:
+            self.current_train_loss = loss.detach().item()
+        
         return (loss, outputs) if return_outputs else loss
     
+    def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+        """
+        Override log to update current metrics
+        """
+        if "loss" in logs:
+            self.current_train_loss = logs["loss"]
+        if "eval_loss" in logs:
+            self.current_eval_loss = logs["eval_loss"]
+        super().log(logs, start_time=start_time)
 
 
 class DetailedProgressCallback(TrainerCallback):
-    """Callback to show detailed training progress"""
+    """Enhanced callback with detailed metrics and generation testing"""
     
-    def __init__(self):
+    def __init__(
+        self, 
+        tokenizer=None, 
+        test_prefixes: Optional[List[str]] = None,
+        generation_config: Optional[Dict[str, Any]] = None,
+        log_frequency: int = 10,
+        use_wandb: bool = False
+    ):
+        """
+        Initialize the detailed progress callback
+        
+        Args:
+            tokenizer: Tokenizer for generation testing
+            test_prefixes: List of prefixes to test generation on
+            generation_config: Configuration for generation
+            log_frequency: How often to update the progress bar (in steps)
+            use_wandb: Whether to log to Weights & Biases
+        """
+        self.tokenizer = tokenizer
+        self.test_prefixes = test_prefixes or [
+            "The movie was",
+            "I really enjoyed",
+            "The plot of this film",
+            "Overall, I would rate",
+            "The acting was"
+        ]
+        
+        self.generation_config = generation_config or {
+            'max_new_tokens': 50,
+            'num_steps': 30,
+            'temperature': 0.8,
+            'top_k': 50,
+            'top_p': 0.9
+        }
+        
+        self.log_frequency = log_frequency
+        self.use_wandb = use_wandb
+        
+        # Metrics tracking
         self.step_count = 0
+        self.train_losses = deque(maxlen=100)  # Keep last 100 losses for smoothing
+        self.eval_losses = []
+        self.current_epoch = 0
+        
+        # Progress bar
+        self.pbar = None
+        self.total_steps = None
+        
+        # Generator (will be initialized when model is available)
+        self.generator = None
     
-    def on_log(self, args, state, control, model=None, logs=None, **kwargs):
-        """Called when logging occurs"""
-        if logs:
-            print(f"Step {state.global_step}: {logs}")
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        """Initialize training progress bar and generator"""
+        self.total_steps = state.max_steps
+        self.pbar = tqdm(total=self.total_steps, desc="Training", position=0, leave=True)
+        
+        # Initialize generator for testing
+        if model is not None and self.tokenizer is not None:
+            try:
+                from eval import FlowMatchingGenerator  # Import from your eval.py
+                device = next(model.parameters()).device
+                self.generator = FlowMatchingGenerator(
+                    model=model,
+                    tokenizer=self.tokenizer,
+                    device=device
+                )
+                print("✓ Generator initialized for prefix testing")
+            except Exception as e:
+                print(f"Warning: Could not initialize generator: {e}")
+                self.generator = None
     
-    def on_train_step_end(self, args, state, control, model=None, **kwargs):
-        """Called at the end of each training step"""
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        """Update progress bar with current metrics"""
         self.step_count += 1
-        if self.step_count % 100 == 0:
-            print(f"Completed {self.step_count} training steps")
+        
+        # Get current loss from trainer
+        trainer = kwargs.get('trainer')
+        if trainer and hasattr(trainer, 'current_train_loss'):
+            if trainer.current_train_loss is not None:
+                self.train_losses.append(trainer.current_train_loss)
+        
+        # Calculate metrics
+        metrics = self._calculate_metrics()
+        
+        # Update progress bar every log_frequency steps
+        if self.step_count % self.log_frequency == 0:
+            self.pbar.update(self.log_frequency)
+            self.pbar.set_postfix(metrics)
+            
+            # Log to wandb if enabled
+            if self.use_wandb and wandb.run is not None:
+                wandb.log({
+                    "train/loss": metrics.get('loss', 0),
+                    "train/ppl": metrics.get('ppl', 0),
+                    "train/lr": self._get_learning_rate(state),
+                    "global_step": state.global_step
+                })
+    
+    def on_evaluate(self, args, state, control, model=None, metrics=None, **kwargs):
+        """Called during evaluation - perform generation testing"""
+        if metrics:
+            eval_loss = metrics.get('eval_loss', None)
+            if eval_loss is not None:
+                self.eval_losses.append(eval_loss)
+                eval_ppl = math.exp(eval_loss) if eval_loss < 10 else float('inf')
+                
+                # Update progress bar with eval metrics
+                self.pbar.set_postfix({
+                    'loss': f"{eval_loss:.4f}",
+                    'eval_ppl': f"{eval_ppl:.2f}",
+                    'epoch': self.current_epoch
+                })
+                
+                print(f"\n📊 Evaluation Results at Step {state.global_step}:")
+                print(f"  • Eval Loss: {eval_loss:.4f}")
+                print(f"  • Eval Perplexity: {eval_ppl:.2f}")
+                
+                # Log to wandb
+                if self.use_wandb and wandb.run is not None:
+                    wandb.log({
+                        "eval/loss": eval_loss,
+                        "eval/ppl": eval_ppl,
+                        "global_step": state.global_step
+                    })
+        
+        # Perform generation testing
+        if self.generator is not None and model is not None:
+            self._test_generation(model, state.global_step)
+    
+    def _test_generation(self, model, step):
+        """Test generation with predefined prefixes"""
+        print(f"\n🎯 Generation Testing at Step {step}:")
+        print("-" * 50)
+        
+        generation_results = []
+        
+        # Set model to eval mode temporarily
+        model.eval()
+        
+        try:
+            # Update generator's model reference if needed
+            self.generator.model = model
+            
+            for prefix in self.test_prefixes:
+                generated = self.generator.generate(
+                    prefix=prefix,
+                    **self.generation_config,
+                    progress_bar=False,
+                    debug=False
+                )
+                
+                generation_results.append({
+                    'prefix': prefix,
+                    'generated': generated
+                })
+                
+                # Print result
+                print(f"📝 Prefix: '{prefix}'")
+                print(f"   Generated: {generated}")
+                print()
+            
+            # Log to wandb if enabled
+            if self.use_wandb and wandb.run is not None:
+                # Create a table for wandb
+                table_data = [[r['prefix'], r['generated']] for r in generation_results]
+                wandb.log({
+                    "generation_samples": wandb.Table(
+                        data=table_data,
+                        columns=["Prefix", "Generated Text"]
+                    ),
+                    "global_step": step
+                })
+                
+        except Exception as e:
+            print(f"⚠️ Generation testing failed: {e}")
+        
+        # Set model back to training mode
+        model.train()
+        
+        print("-" * 50)
     
     def on_epoch_end(self, args, state, control, model=None, **kwargs):
         """Called at the end of each epoch"""
-        print(f"Completed epoch {state.epoch}")
+        self.current_epoch = state.epoch
+        
+        # Calculate epoch metrics
+        metrics = self._calculate_metrics()
+        
+        print(f"\n✅ Completed Epoch {self.current_epoch}")
+        print(f"  • Average Train Loss: {metrics.get('loss', 'N/A')}")
+        print(f"  • Average Train PPL: {metrics.get('ppl', 'N/A')}")
+        
+        if self.eval_losses:
+            latest_eval_loss = self.eval_losses[-1]
+            eval_ppl = math.exp(latest_eval_loss) if latest_eval_loss < 10 else float('inf')
+            print(f"  • Latest Eval Loss: {latest_eval_loss:.4f}")
+            print(f"  • Latest Eval PPL: {eval_ppl:.2f}")
     
-    def on_evaluate(self, args, state, control, model=None, logs=None, **kwargs):
-        """Called during evaluation"""
+    def on_train_end(self, args, state, control, model=None, **kwargs):
+        """Clean up progress bar"""
+        if self.pbar:
+            self.pbar.close()
+        
+        print("\n🎉 Training Completed!")
+        print(f"  • Total Steps: {state.global_step}")
+        print(f"  • Total Epochs: {state.epoch}")
+        
+        # Final generation test
+        if self.generator is not None and model is not None:
+            print("\n🏁 Final Generation Test:")
+            self._test_generation(model, state.global_step)
+    
+    def on_log(self, args, state, control, model=None, logs=None, **kwargs):
+        """Process log entries"""
         if logs:
-            print(f"Evaluation results: {logs}")
+            # Extract metrics from logs
+            if 'loss' in logs:
+                self.train_losses.append(logs['loss'])
+            
+            # Update progress bar with latest metrics
+            if self.pbar and state.global_step % self.log_frequency == 0:
+                metrics = self._calculate_metrics()
+                if 'eval_loss' in logs:
+                    eval_ppl = math.exp(logs['eval_loss']) if logs['eval_loss'] < 10 else float('inf')
+                    metrics['eval_loss'] = f"{logs['eval_loss']:.4f}"
+                    metrics['eval_ppl'] = f"{eval_ppl:.2f}"
+                
+                self.pbar.set_postfix(metrics)
+    
+    def _calculate_metrics(self) -> Dict[str, Any]:
+        """Calculate current training metrics"""
+        metrics = {}
+        
+        # Calculate smoothed train loss
+        if self.train_losses:
+            avg_loss = sum(self.train_losses) / len(self.train_losses)
+            metrics['loss'] = f"{avg_loss:.4f}"
+            # Calculate perplexity
+            ppl = math.exp(avg_loss) if avg_loss < 10 else float('inf')
+            metrics['ppl'] = f"{ppl:.2f}"
+        
+        # Add eval metrics if available
+        if self.eval_losses:
+            latest_eval = self.eval_losses[-1]
+            metrics['eval_loss'] = f"{latest_eval:.4f}"
+            eval_ppl = math.exp(latest_eval) if latest_eval < 10 else float('inf')
+            metrics['eval_ppl'] = f"{eval_ppl:.2f}"
+        
+        # Add epoch
+        metrics['epoch'] = self.current_epoch
+        
+        return metrics
+    
+    def _get_learning_rate(self, state) -> float:
+        """Get current learning rate from scheduler"""
+        if hasattr(state, 'scheduler') and state.scheduler is not None:
+            return state.scheduler.get_last_lr()[0]
+        return 0.0
 
 
 def load_training_args_from_yaml(yaml_path: str) -> TrainingArguments:

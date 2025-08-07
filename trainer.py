@@ -198,6 +198,28 @@ dataset_config:
     
     # Create trainer
     print("Creating trainer...")
+    
+    # Create detailed callback with generation testing
+    detailed_callback = DetailedProgressCallback(
+        tokenizer=tokenizer,
+        test_prefixes=[
+            "The movie was",
+            "I really enjoyed",
+            "This film is",
+            "The best part",
+            "I would recommend"
+        ],
+        generation_config={
+            'max_new_tokens': 30,
+            'num_steps': 25,
+            'temperature': 0.8,
+            'top_k': 50,
+            'top_p': 0.9
+        },
+        log_frequency=10,
+        use_wandb=False  # Set to True if you want to use Weights & Biases
+    )
+    
     trainer = MyTrainer(
         model=model,
         args=training_args,
@@ -205,7 +227,7 @@ dataset_config:
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
-        callbacks=[DetailedProgressCallback()],
+        callbacks=[detailed_callback],
     )
     
     # Override any gradient checkpointing settings in the trainer

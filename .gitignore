@@ -121,6 +121,7 @@ cython_debug/
 # 训练日志
 llm_cosformer_results/
 logs/
+wandb/
 
 # 数据
 stanfordnlp/

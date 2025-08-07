@@ -1,40 +1,44 @@
 """
-Flow Matching Generation Module
+Flow Matching Generation Module with Polynomial Path
 Implements generation/sampling for the trained LLFMCosformerForFlowMatching model
+using the same polynomial path as during training
 """
 
 import torch
 import torch.nn.functional as F
-from typing import Optional, List, Union, Tuple
+from typing import Optional, List, Union, Tuple, Dict, Any
 import numpy as np
 from transformers import AutoTokenizer
 from CosFormer.configuration_LLMFCosformer import LLMFCosformerConfig
 from CosFormer.cosformer import LLFMCosformerForFlowMatching
 from tqdm import tqdm
 import os
+from omegaconf import OmegaConf
+from flow_matching.path import MixtureDiscreteProbPath
+from flow_matching.path.scheduler import PolynomialConvexScheduler
+from evalution.logic.flow import get_path, get_source_distribution
 
 
 class FlowMatchingGenerator:
     """
-    Generator class for Flow Matching Language Models
-    Supports various sampling strategies including:
-    - Euler sampling
-    - Adaptive step size sampling
-    - Temperature-based sampling
+    Generator class for Flow Matching Language Models using Polynomial Path
+    Matches the training configuration for consistent generation
     """
     
     def __init__(
         self,
         model: LLFMCosformerForFlowMatching,
         tokenizer: AutoTokenizer,
+        config_path: str = "config/trainingargs.yml",
         device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ):
         """
-        Initialize the generator
+        Initialize the generator with polynomial path matching training
         
         Args:
             model: Trained flow matching model
             tokenizer: Tokenizer for encoding/decoding text
+            config_path: Path to training configuration file
             device: Device to run generation on
         """
         self.model = model.to(device)
@@ -45,12 +49,41 @@ class FlowMatchingGenerator:
         # Set model to eval mode
         self.model.eval()
         
+        # Load flow matching configuration to match training
+        try:
+            flow_cfg = OmegaConf.load(config_path).trainer_args
+        except:
+            # Default configuration if file doesn't exist
+            flow_cfg = OmegaConf.create({
+                'scheduler_type': 'polynomial',
+                'exponent': 2.0,
+                'source_distribution': 'mask',
+                'time_epsilon': 1e-3
+            })
+        
+        self.flow_cfg = flow_cfg
+        
+        # Initialize the same path as used in training
+        self.path = get_path(
+            scheduler_type=flow_cfg.scheduler_type,
+            exponent=flow_cfg.get('exponent', 2.0)
+        )
+        
+        # Initialize source distribution
+        self.source_distribution = get_source_distribution(
+            source_distribution=flow_cfg.source_distribution,
+            vocab_size=self.vocab_size
+        )
+        
         # Get mask token if model uses masking
         self.mask_token_id = self.vocab_size if model.masked else None
         
+        print(f"Generator initialized with {flow_cfg.scheduler_type} path (exponent={flow_cfg.get('exponent', 2.0)})")
+    
     def sample_prior(self, shape: Tuple[int, int]) -> torch.LongTensor:
         """
         Sample from the prior distribution (source distribution)
+        Uses the same distribution as training
         
         Args:
             shape: (batch_size, seq_len) shape for sampling
@@ -58,53 +91,74 @@ class FlowMatchingGenerator:
         Returns:
             Sampled tokens from prior distribution
         """
-        if self.mask_token_id is not None:
-            # Use mask tokens as prior
-            return torch.full(shape, self.mask_token_id, dtype=torch.long, device=self.device)
-        else:
-            # Use uniform distribution as prior
-            return torch.randint(0, self.vocab_size, shape, dtype=torch.long, device=self.device)
+        # Create a dummy tensor for shape
+        dummy = torch.zeros(shape, dtype=torch.long, device=self.device)
+        # Use the source distribution's sample_like method
+        return self.source_distribution.sample_like(dummy)
     
-    # 这个地方需要修改，不能使用欧拉采样步骤，需要使用多项式采样，参考Trainer中的代码
-    def euler_sample_step(
+    def compute_velocity(
         self,
         x_t: torch.LongTensor,
-        t: float,
-        dt: float,
+        t: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute the velocity field v(x_t, t) using the trained model
+        
+        Args:
+            x_t: Current tokens at time t
+            t: Current time step(s)
+            attention_mask: Attention mask for the sequence
+            
+        Returns:
+            Velocity field as probability distributions
+        """
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=x_t,
+                timesteps=t,
+                attention_mask=attention_mask,
+                return_dict=True
+            )
+            logits = outputs.logits  # (batch_size, seq_len, vocab_size)
+        
+        return logits
+    
+    def polynomial_sample_step(
+        self,
+        x_t: torch.LongTensor,
+        x_0: torch.LongTensor,
+        t_start: float,
+        t_end: float,
         attention_mask: Optional[torch.Tensor] = None,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
     ) -> torch.LongTensor:
         """
-        Perform one Euler sampling step
+        Perform one polynomial path sampling step
+        This matches the polynomial convex scheduler used in training
         
         Args:
-            x_t: Current tokens at time t
-            t: Current time step (between 0 and 1)
-            dt: Time step size
+            x_t: Current tokens at time t_start
+            x_0: Source tokens (prior samples)
+            t_start: Starting time step
+            t_end: Ending time step
             attention_mask: Attention mask for the sequence
             temperature: Sampling temperature
             top_k: Top-k sampling parameter
             top_p: Top-p (nucleus) sampling parameter
             
         Returns:
-            Updated tokens at time t + dt
+            Updated tokens at time t_end
         """
         batch_size, seq_len = x_t.shape
         
-        # Create timesteps tensor
-        timesteps = torch.full((batch_size,), t, dtype=torch.float32, device=self.device)
+        # Create time tensors
+        t_start_tensor = torch.full((batch_size,), t_start, dtype=torch.float32, device=self.device)
         
-        # Get model predictions
-        with torch.no_grad():
-            outputs = self.model(
-                input_ids=x_t,
-                timesteps=timesteps,
-                attention_mask=attention_mask,
-                return_dict=True
-            )
-            logits = outputs.logits  # (batch_size, seq_len, vocab_size)
+        # Get model predictions (velocity field)
+        logits = self.compute_velocity(x_t, t_start_tensor, attention_mask)
         
         # Apply temperature
         if temperature != 1.0:
@@ -113,9 +167,71 @@ class FlowMatchingGenerator:
         # Convert logits to probabilities
         probs = F.softmax(logits, dim=-1)
         
+        # Apply filtering techniques
+        filtered_probs = self._apply_filtering(probs, top_k, top_p)
+        
+        # Sample predicted target tokens x_1
+        x_1_pred = self._sample_from_probs(filtered_probs, t_start)
+        
+        # For polynomial path: x_t = (1 - sigma_t) * x_0 + sigma_t * x_1
+        # where sigma_t = t^exponent
+        exponent = self.flow_cfg.get('exponent', 2.0)
+        
+        # During generation, we go from t=1 (noise) to t=0 (clean)
+        # We need to compute how much to transition from current state toward predicted clean state
+        
+        if t_start <= 0.001:  # Very close to the end
+            # Just return the predicted tokens
+            return x_1_pred
+        
+        # Compute sigma values for polynomial schedule
+        sigma_start = t_start ** exponent
+        sigma_end = max(0.0, t_end ** exponent)  # Ensure non-negative
+        
+        # For generation, we're denoising, so we move from noisy (x_0) toward clean (x_1)
+        # The amount of transition depends on the change in sigma
+        if t_start >= 0.999:  # At the very beginning
+            # Start with mostly noise, small transition toward predicted
+            transition_prob = 1.0 - sigma_end  # How much to move toward x_1
+        elif sigma_start > 1e-6:  # Normal case
+            # Calculate how much we should transition
+            # As t decreases, we should move more toward x_1
+            transition_prob = (sigma_start - sigma_end) / sigma_start
+            transition_prob = min(1.0, max(0.0, transition_prob))  # Clamp to [0, 1]
+        else:
+            # Near the end, mostly use predictions
+            transition_prob = 0.9
+        
+        # Apply stochastic transition
+        # For discrete tokens, we use probabilistic replacement
+        transition_mask = torch.rand_like(x_t, dtype=torch.float32) < transition_prob
+        
+        # Update tokens: replace some tokens with predicted clean tokens
+        x_next = torch.where(transition_mask, x_1_pred, x_t)
+        
+        return x_next
+    
+    def _apply_filtering(
+        self,
+        probs: torch.Tensor,
+        top_k: Optional[int],
+        top_p: Optional[float]
+    ) -> torch.Tensor:
+        """
+        Apply top-k and top-p filtering to probability distributions
+        
+        Args:
+            probs: Probability distributions
+            top_k: Top-k parameter
+            top_p: Top-p parameter
+            
+        Returns:
+            Filtered probabilities
+        """
         # Apply top-k filtering
         if top_k is not None and top_k > 0:
             indices_to_remove = probs < torch.topk(probs, top_k, dim=-1)[0][..., -1, None]
+            probs = probs.clone()
             probs[indices_to_remove] = 0
             probs = probs / probs.sum(dim=-1, keepdim=True)
         
@@ -130,22 +246,44 @@ class FlowMatchingGenerator:
             sorted_indices_to_remove[..., 0] = 0
             
             indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
+            probs = probs.clone()
             probs[indices_to_remove] = 0
             probs = probs / probs.sum(dim=-1, keepdim=True)
         
-        # Sample from the distribution
-        if t < 0.1:  # Near the end, use argmax for stability
-            x_next = torch.argmax(probs, dim=-1)
+        return probs
+    
+    def _sample_from_probs(self, probs: torch.Tensor, t: float) -> torch.LongTensor:
+        """
+        Sample tokens from probability distributions
+        
+        Args:
+            probs: Probability distributions
+            t: Current time step (used to determine sampling strategy)
+            
+        Returns:
+            Sampled tokens
+        """
+        batch_size, seq_len, vocab_size = probs.shape
+        
+        # Near the end of generation (t close to 0), use more deterministic sampling
+        if t < 0.1:
+            # Use argmax for final steps
+            return torch.argmax(probs, dim=-1)
+        elif t < 0.3:
+            # Use top-1 from multinomial sampling for stability
+            probs_reshaped = probs.view(-1, vocab_size)
+            # Add small epsilon for numerical stability
+            probs_reshaped = probs_reshaped + 1e-10
+            probs_reshaped = probs_reshaped / probs_reshaped.sum(dim=-1, keepdim=True)
+            samples = torch.multinomial(probs_reshaped, 1).view(batch_size, seq_len)
+            return samples
         else:
-            x_next = torch.multinomial(probs.view(-1, self.vocab_size), 1).view(batch_size, seq_len)
-        
-        # Interpolate between current and next state based on dt
-        # For discrete data, we use a probabilistic transition
-        transition_prob = 1 - t + dt
-        mask = torch.rand_like(x_t, dtype=torch.float32) < transition_prob
-        x_t = torch.where(mask, x_next, x_t)
-        
-        return x_t
+            # Full stochastic sampling for early steps
+            probs_reshaped = probs.view(-1, vocab_size)
+            probs_reshaped = probs_reshaped + 1e-10
+            probs_reshaped = probs_reshaped / probs_reshaped.sum(dim=-1, keepdim=True)
+            samples = torch.multinomial(probs_reshaped, 1).view(batch_size, seq_len)
+            return samples
     
     @torch.no_grad()
     def generate(
@@ -156,12 +294,12 @@ class FlowMatchingGenerator:
         temperature: float = 0.8,
         top_k: Optional[int] = 50,
         top_p: Optional[float] = 0.9,
-        adaptive_steps: bool = False,
+        adaptive_steps: bool = True,
         return_intermediate: bool = False,
         progress_bar: bool = True,
     ) -> Union[str, List[str], Tuple[List[str], List[torch.LongTensor]]]:
         """
-        Generate text continuation given a prefix
+        Generate text continuation given a prefix using polynomial path
         
         Args:
             prefix: Input text or list of texts to continue from
@@ -192,7 +330,7 @@ class FlowMatchingGenerator:
             padding=True,
             truncation=True,
             return_tensors="pt",
-            max_length=512,  # Adjust based on your model's max length
+            max_length=512,
         ).to(self.device)
         
         prefix_ids = prefix_encoding["input_ids"]
@@ -203,58 +341,65 @@ class FlowMatchingGenerator:
         total_len = min(prefix_len + max_new_tokens, self.model.config.max_position_embeddings)
         new_token_len = total_len - prefix_len
         
-        # Initialize with random tokens for the continuation
-        x_0 = self.sample_prior((batch_size, new_token_len))
+        # Initialize with samples from source distribution
+        x_0_continuation = self.sample_prior((batch_size, new_token_len))
         
-        # Concatenate prefix with random initialization
-        full_ids = torch.cat([prefix_ids, x_0], dim=1)
+        # Full sequence: prefix + random initialization
+        x_0_full = torch.cat([prefix_ids, x_0_continuation], dim=1)
+        x_t = x_0_full.clone()
         
         # Create attention mask for full sequence
         continuation_mask = torch.ones((batch_size, new_token_len), dtype=torch.long, device=self.device)
         full_attention_mask = torch.cat([prefix_attention_mask, continuation_mask], dim=1)
         
         # Create a mask to keep prefix fixed during generation
-        prefix_mask = torch.zeros_like(full_ids, dtype=torch.bool)
+        prefix_mask = torch.zeros_like(x_t, dtype=torch.bool)
         prefix_mask[:, :prefix_len] = True
         
         # Store intermediate states if requested
         intermediate_states = [] if return_intermediate else None
         
-        # Calculate step sizes
+        # Calculate time steps for polynomial path
         if adaptive_steps:
-            # Use smaller steps at the beginning and larger steps at the end
+            # Use polynomial spacing that matches the path
+            exponent = self.flow_cfg.get('exponent', 2.0)
+            # For generation, we go from t=1 (noise) to t=0 (clean)
+            # Create more steps near t=0 where the most important denoising happens
             ts = np.linspace(0, 1, num_steps + 1)
-            ts = ts ** 2  # Quadratic spacing
-            step_sizes = np.diff(ts)
+            # Apply power transformation for better step distribution
+            ts = 1.0 - (1.0 - ts) ** (1.0 / exponent)
+            # Ensure we start at 1 and end at 0
+            ts[0] = 1.0
+            ts[-1] = 0.0
+            # Reverse to go from 1 to 0
+            ts = ts[::-1]
         else:
-            step_sizes = [1.0 / num_steps] * num_steps
+            # Uniform time steps from 1 to 0
+            ts = np.linspace(1.0, 0.0, num_steps + 1)
         
-        # Reverse time flow (from t=1 to t=0)
-        current_t = 1.0
-        x_t = full_ids.clone()
+        # Generation loop following polynomial path
+        iterator = enumerate(zip(ts[:-1], ts[1:]))
+        if progress_bar:
+            iterator = tqdm(iterator, total=num_steps, desc="Generating")
         
-        # Generation loop
-        iterator = tqdm(range(num_steps), desc="Generating", disable=not progress_bar)
-        for step_idx in iterator:
-            dt = step_sizes[step_idx]
-            
-            # Perform one sampling step
-            x_t_new = self.euler_sample_step(
+        for step_idx, (t_start, t_end) in iterator:
+            # Perform one polynomial path sampling step
+            x_t_new = self.polynomial_sample_step(
                 x_t=x_t,
-                t=current_t,
-                dt=dt,
+                x_0=x_0_full,  # Pass the source samples
+                t_start=t_start,
+                t_end=t_end,
                 attention_mask=full_attention_mask,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
             )
             
-            # Keep prefix fixed
-            x_t = torch.where(prefix_mask, full_ids, x_t_new)
-            
-            # Update time
-            current_t -= dt
-            current_t = max(current_t, 0.0)
+            # Keep prefix fixed - ensure dimensions match
+            # x_t_new should have the same shape as x_t
+            # Only update the continuation part, keep prefix unchanged
+            x_t = x_t.clone()
+            x_t[:, prefix_len:] = x_t_new[:, prefix_len:]
             
             # Store intermediate state
             if return_intermediate:
@@ -286,6 +431,44 @@ class FlowMatchingGenerator:
             if single_input:
                 return generated_texts[0]
             return generated_texts
+    
+    def generate_with_custom_path(
+        self,
+        prefix: Union[str, List[str]],
+        scheduler_type: str = "polynomial",
+        exponent: float = 2.0,
+        **kwargs
+    ) -> Union[str, List[str]]:
+        """
+        Generate with a custom path configuration
+        
+        Args:
+            prefix: Input text or list of texts
+            scheduler_type: Type of scheduler to use
+            exponent: Exponent for polynomial scheduler
+            **kwargs: Additional arguments for generate()
+            
+        Returns:
+            Generated text(s)
+        """
+        # Temporarily override path configuration
+        original_path = self.path
+        original_exponent = self.flow_cfg.get('exponent', 2.0)
+        
+        try:
+            # Create new path with custom settings
+            self.path = get_path(scheduler_type=scheduler_type, exponent=exponent)
+            self.flow_cfg['exponent'] = exponent
+            
+            # Generate with custom path
+            result = self.generate(prefix, **kwargs)
+            
+        finally:
+            # Restore original path
+            self.path = original_path
+            self.flow_cfg['exponent'] = original_exponent
+        
+        return result
 
 
 def load_model_and_tokenizer(checkpoint_path: str, device: str = "cuda"):
@@ -306,11 +489,25 @@ def load_model_and_tokenizer(checkpoint_path: str, device: str = "cuda"):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
+    # Load config
+    config = LLMFCosformerConfig.from_pretrained(checkpoint_path)
+    
+    # Check if model was trained with masking
+    config_path = "config/trainingargs.yml"
+    masked = True
+    if os.path.exists(config_path):
+        try:
+            flow_cfg = OmegaConf.load(config_path).trainer_args
+            masked = flow_cfg.get('source_distribution', 'mask') == 'mask'
+        except:
+            pass
+    
     # Load model
     model = LLFMCosformerForFlowMatching.from_pretrained(
         checkpoint_path,
-        masked=True,
-        trust_remote_code=True
+        config=config,
+        masked=masked,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
     )
     
     model = model.to(device)
@@ -323,25 +520,21 @@ def load_model_and_tokenizer(checkpoint_path: str, device: str = "cuda"):
 # ============== Test Examples ==============
 
 def test_basic_generation():
-    """Test basic text generation with different prefixes"""
+    """Test basic text generation with polynomial path"""
     
-    # Path to your trained model
     checkpoint_path = "./llm_cosformer_results"
     
-    # Check if model exists
     if not os.path.exists(checkpoint_path):
         print(f"Model checkpoint not found at {checkpoint_path}")
         print("Please train the model first using trainer.py")
         return
     
-    # Load model and tokenizer
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, tokenizer = load_model_and_tokenizer(checkpoint_path, device)
     
-    # Create generator
-    generator = FlowMatchingGenerator(model, tokenizer, device)
+    # Create generator with polynomial path
+    generator = FlowMatchingGenerator(model, tokenizer, device=device)
     
-    # Test prefixes
     test_prefixes = [
         "The movie was",
         "I really enjoyed",
@@ -351,42 +544,30 @@ def test_basic_generation():
     ]
     
     print("\n" + "="*50)
-    print("Basic Generation Test")
+    print("Polynomial Path Generation Test")
     print("="*50)
     
     for prefix in test_prefixes:
         print(f"\nPrefix: '{prefix}'")
         
-        # Generate with different settings
-        # Conservative generation
+        # Generate with polynomial path (matching training)
         generated = generator.generate(
             prefix=prefix,
             max_new_tokens=50,
             num_steps=30,
-            temperature=0.7,
-            top_k=40,
+            temperature=0.8,
+            top_k=50,
             top_p=0.9,
+            adaptive_steps=True,  # Use adaptive steps for polynomial path
             progress_bar=False
         )
-        print(f"Conservative: {generated}")
-        
-        # Creative generation
-        generated = generator.generate(
-            prefix=prefix,
-            max_new_tokens=50,
-            num_steps=30,
-            temperature=1.2,
-            top_k=100,
-            top_p=0.95,
-            progress_bar=False
-        )
-        print(f"Creative: {generated}")
+        print(f"Generated: {generated}")
 
 
-def test_batch_generation():
-    """Test batch generation with multiple prefixes"""
+def test_different_exponents():
+    """Test generation with different polynomial exponents"""
     
-    checkpoint_path = "llm_cosformer_results/checkpoint-1035"
+    checkpoint_path = "./llm_cosformer_results"
     
     if not os.path.exists(checkpoint_path):
         print(f"Model checkpoint not found at {checkpoint_path}")
@@ -394,13 +575,47 @@ def test_batch_generation():
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, tokenizer = load_model_and_tokenizer(checkpoint_path, device)
-    generator = FlowMatchingGenerator(model, tokenizer, device)
+    generator = FlowMatchingGenerator(model, tokenizer, device=device)
     
     print("\n" + "="*50)
-    print("Batch Generation Test")
+    print("Different Polynomial Exponents Test")
     print("="*50)
     
-    # Multiple prefixes at once
+    prefix = "This movie deserves"
+    exponents = [1.0, 2.0, 3.0, 4.0]
+    
+    print(f"\nPrefix: '{prefix}'")
+    
+    for exp in exponents:
+        generated = generator.generate_with_custom_path(
+            prefix=prefix,
+            scheduler_type="polynomial",
+            exponent=exp,
+            max_new_tokens=40,
+            num_steps=30,
+            temperature=0.8,
+            progress_bar=False
+        )
+        print(f"\nExponent {exp}: {generated}")
+
+
+def test_batch_generation():
+    """Test batch generation with polynomial path"""
+    
+    checkpoint_path = "./llm_cosformer_results"
+    
+    if not os.path.exists(checkpoint_path):
+        print(f"Model checkpoint not found at {checkpoint_path}")
+        return
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, tokenizer = load_model_and_tokenizer(checkpoint_path, device)
+    generator = FlowMatchingGenerator(model, tokenizer, device=device)
+    
+    print("\n" + "="*50)
+    print("Batch Generation with Polynomial Path")
+    print("="*50)
+    
     prefixes = [
         "This movie is absolutely",
         "I was disappointed by",
@@ -413,6 +628,7 @@ def test_batch_generation():
         max_new_tokens=40,
         num_steps=25,
         temperature=0.8,
+        adaptive_steps=True,
         progress_bar=True
     )
     
@@ -422,7 +638,7 @@ def test_batch_generation():
 
 
 def test_intermediate_states():
-    """Test generation with intermediate states visualization"""
+    """Test generation with intermediate states using polynomial path"""
     
     checkpoint_path = "./llm_cosformer_results"
     
@@ -432,20 +648,20 @@ def test_intermediate_states():
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, tokenizer = load_model_and_tokenizer(checkpoint_path, device)
-    generator = FlowMatchingGenerator(model, tokenizer, device)
+    generator = FlowMatchingGenerator(model, tokenizer, device=device)
     
     print("\n" + "="*50)
-    print("Intermediate States Test")
+    print("Polynomial Path Evolution Test")
     print("="*50)
     
     prefix = "The best part about this movie"
     
-    # Generate with intermediate states
     final_text, intermediate_states = generator.generate(
         prefix=prefix,
         max_new_tokens=30,
         num_steps=10,
         temperature=0.8,
+        adaptive_steps=True,
         return_intermediate=True,
         progress_bar=True
     )
@@ -453,21 +669,20 @@ def test_intermediate_states():
     print(f"\nPrefix: '{prefix}'")
     print(f"Final generation: {final_text}")
     
-    # Show evolution at certain steps
-    print("\nEvolution of generation:")
+    print("\nEvolution of generation (polynomial path):")
     steps_to_show = [0, len(intermediate_states)//3, 2*len(intermediate_states)//3, -1]
     
     for i, step_idx in enumerate(steps_to_show):
         state = intermediate_states[step_idx]
-        # Decode just the generated part
         prefix_len = len(tokenizer.encode(prefix))
         generated_ids = state[0, prefix_len:]
         generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-        print(f"Step {step_idx if step_idx >= 0 else len(intermediate_states)-1}: {prefix}{generated_text}")
+        progress = (step_idx if step_idx >= 0 else len(intermediate_states)-1) / len(intermediate_states) * 100
+        print(f"Step {step_idx} ({progress:.0f}%): {prefix}{generated_text}")
 
 
-def test_temperature_effects():
-    """Test the effect of different temperature settings"""
+def test_adaptive_vs_uniform_steps():
+    """Compare adaptive vs uniform time steps in polynomial path"""
     
     checkpoint_path = "./llm_cosformer_results"
     
@@ -477,41 +692,51 @@ def test_temperature_effects():
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, tokenizer = load_model_and_tokenizer(checkpoint_path, device)
-    generator = FlowMatchingGenerator(model, tokenizer, device)
+    generator = FlowMatchingGenerator(model, tokenizer, device=device)
     
     print("\n" + "="*50)
-    print("Temperature Effects Test")
+    print("Adaptive vs Uniform Steps Test")
     print("="*50)
     
-    prefix = "This film deserves"
-    temperatures = [0.5, 0.8, 1.0, 1.5]
+    prefix = "In my opinion, this film"
     
     print(f"\nPrefix: '{prefix}'")
     
-    for temp in temperatures:
-        generated = generator.generate(
-            prefix=prefix,
-            max_new_tokens=40,
-            num_steps=30,
-            temperature=temp,
-            top_k=50,
-            progress_bar=False
-        )
-        print(f"\nTemperature {temp}: {generated}")
+    # Generate with adaptive steps
+    generated_adaptive = generator.generate(
+        prefix=prefix,
+        max_new_tokens=50,
+        num_steps=30,
+        temperature=0.8,
+        adaptive_steps=True,
+        progress_bar=False
+    )
+    print(f"\nAdaptive steps: {generated_adaptive}")
+    
+    # Generate with uniform steps
+    generated_uniform = generator.generate(
+        prefix=prefix,
+        max_new_tokens=50,
+        num_steps=30,
+        temperature=0.8,
+        adaptive_steps=False,
+        progress_bar=False
+    )
+    print(f"\nUniform steps: {generated_uniform}")
 
 
 def run_all_tests():
     """Run all test examples"""
     
     print("\n" + "="*60)
-    print("FLOW MATCHING GENERATION TESTS")
+    print("POLYNOMIAL PATH FLOW MATCHING GENERATION TESTS")
     print("="*60)
     
-    # Run all tests
     test_basic_generation()
+    test_different_exponents()
     test_batch_generation()
     test_intermediate_states()
-    test_temperature_effects()
+    test_adaptive_vs_uniform_steps()
     
     print("\n" + "="*60)
     print("ALL TESTS COMPLETED")
@@ -522,29 +747,40 @@ if __name__ == "__main__":
     # Run all tests
     run_all_tests()
     
-    # Or run interactive generation
+    # Interactive generation
     print("\n" + "="*60)
-    print("INTERACTIVE GENERATION")
+    print("INTERACTIVE GENERATION WITH POLYNOMIAL PATH")
     print("="*60)
     
     checkpoint_path = "./llm_cosformer_results"
     if os.path.exists(checkpoint_path):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model, tokenizer = load_model_and_tokenizer(checkpoint_path, device)
-        generator = FlowMatchingGenerator(model, tokenizer, device)
+        generator = FlowMatchingGenerator(model, tokenizer, device=device)
+        
+        print("\nUsing polynomial path matching your training configuration")
+        print("Commands: 'quit' to exit, 'config' to show current settings")
         
         while True:
-            prefix = input("\nEnter a prefix (or 'quit' to exit): ")
-            if prefix.lower() == 'quit':
+            user_input = input("\nEnter a prefix (or command): ")
+            
+            if user_input.lower() == 'quit':
                 break
+            elif user_input.lower() == 'config':
+                print(f"Current configuration:")
+                print(f"  Scheduler: {generator.flow_cfg.scheduler_type}")
+                print(f"  Exponent: {generator.flow_cfg.get('exponent', 2.0)}")
+                print(f"  Source distribution: {generator.flow_cfg.source_distribution}")
+                continue
             
             generated = generator.generate(
-                prefix=prefix,
+                prefix=user_input,
                 max_new_tokens=100,
                 num_steps=50,
                 temperature=0.8,
                 top_k=50,
-                top_p=0.9
+                top_p=0.9,
+                adaptive_steps=True
             )
             
             print(f"\nGenerated: {generated}")
