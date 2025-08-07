@@ -31,7 +31,8 @@ class MyDataset(IterableDataset):
         dataset_name: str, 
         split: str, 
         chunk_size: int = 512,
-        max_samples: Optional[int] = None
+        max_samples: Optional[int] = None,
+        data_files: Optional[Union[str, List[str]]] = None
     ):
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         if self.tokenizer.pad_token is None:
@@ -41,13 +42,29 @@ class MyDataset(IterableDataset):
         self.dataset_name = dataset_name
         self.split = split
         self.max_samples = max_samples
+        self.data_files = data_files
+        self.is_local = self._is_local_path(dataset_name)
         
         # For IterableDataset, we don't load all data upfront
         # Instead, we'll stream it in __iter__
+    def __len__(self):
+        """Approximate length of the dataset"""
+        # For IterableDataset, we can't know exact size upfront
+        # Return a large number to ensure we don't run out of data
+        return 1000000000
+    
+    def _is_local_path(self, path: str) -> bool:
+        """Check if the dataset path is a local directory or file"""
+        import os
+        return os.path.exists(path) or path.startswith('/') or path.startswith('./') or path.startswith('../')
     
     def _process_text(self, text: str):
         """Process a single text into tokenized chunks"""
         chunks = []
+        
+        # Skip empty or very short texts
+        if not text or len(text.strip()) < 10:
+            return chunks
         
         # Tokenize text
         tokens = self.tokenizer(
@@ -65,45 +82,127 @@ class MyDataset(IterableDataset):
         
         return chunks
     
-    def __len__(self):
-        """Approximate length of the dataset"""
-        # For IterableDataset, we can't know exact size upfront
-        # Return a large number to ensure we don't run out of data
-        return 1000000000
-    
     def __iter__(self):
         """Iterator for streaming data"""
-        # Load dataset in streaming mode if possible
-        raw_dataset = load_dataset(self.dataset_name, split=self.split, streaming=True)
+        import os
+        
+        # Determine how to load the dataset
+        if self.is_local:
+            print(f"Loading local dataset from: {self.dataset_name}")
+            
+            # Check if it's a directory with parquet/json/txt files
+            if os.path.isdir(self.dataset_name):
+                # Look for data files in the directory
+                data_files = []
+                for ext in ['*.parquet', '*.json', '*.jsonl', '*.txt', '*.csv']:
+                    import glob
+                    files = glob.glob(os.path.join(self.dataset_name, '**', ext), recursive=True)
+                    if files:
+                        data_files.extend(files)
+                        break  # Use the first type of files found
+                
+                if not data_files:
+                    raise ValueError(f"No supported data files found in {self.dataset_name}")
+                
+                # Determine file type from extension
+                ext = os.path.splitext(data_files[0])[1].lower()
+                if ext == '.parquet':
+                    data_type = 'parquet'
+                elif ext in ['.json', '.jsonl']:
+                    data_type = 'json'
+                elif ext == '.txt':
+                    data_type = 'text'
+                elif ext == '.csv':
+                    data_type = 'csv'
+                else:
+                    data_type = None
+                
+                print(f"Found {len(data_files)} {ext} files")
+                
+                # Load dataset with appropriate loader
+                if data_type:
+                    raw_dataset = load_dataset(
+                        data_type, 
+                        data_files=data_files,
+                        split=self.split if self.split != "test" else "train",  # Some local datasets only have train split
+                        streaming=True
+                    )
+                else:
+                    # Try loading as a local dataset directory (e.g., if it has dataset_info.json)
+                    raw_dataset = load_dataset(
+                        self.dataset_name,
+                        split=self.split,
+                        streaming=True
+                    )
+            else:
+                # It's a single file
+                ext = os.path.splitext(self.dataset_name)[1].lower()
+                if ext == '.parquet':
+                    raw_dataset = load_dataset('parquet', data_files=self.dataset_name, split='train', streaming=True)
+                elif ext in ['.json', '.jsonl']:
+                    raw_dataset = load_dataset('json', data_files=self.dataset_name, split='train', streaming=True)
+                elif ext == '.txt':
+                    raw_dataset = load_dataset('text', data_files=self.dataset_name, split='train', streaming=True)
+                elif ext == '.csv':
+                    raw_dataset = load_dataset('csv', data_files=self.dataset_name, split='train', streaming=True)
+                else:
+                    raise ValueError(f"Unsupported file type: {ext}")
+        else:
+            # Load from HuggingFace Hub
+            print(f"Loading dataset from HuggingFace Hub: {self.dataset_name}")
+            if self.data_files:
+                raw_dataset = load_dataset(
+                    self.dataset_name, 
+                    data_files=self.data_files,
+                    split=self.split, 
+                    streaming=True
+                )
+            else:
+                raw_dataset = load_dataset(
+                    self.dataset_name, 
+                    split=self.split, 
+                    streaming=True
+                )
         
         sample_count = 0
+        chunk_count = 0
+        
         for item in raw_dataset:
             # Check if we've reached max_samples
-            if self.max_samples is not None and sample_count >= self.max_samples:
+            if self.max_samples is not None and chunk_count >= self.max_samples:
                 break
             
-            # Extract text from item
-            if 'text' in item:
-                text = item['text']
-            elif 'review' in item:  # For IMDB dataset
-                text = item['review']
-            else:
+            # Extract text from item - try multiple common field names
+            text = None
+            for field in ['text', 'content', 'document', 'review', 'passage', 'article', 'story']:
+                if field in item:
+                    text = item[field]
+                    break
+            
+            # If no text field found, skip this item
+            if text is None:
+                # Print available fields for the first item to help debug
+                if sample_count == 0:
+                    print(f"Warning: No text field found. Available fields: {list(item.keys())}")
                 continue
+            
+            sample_count += 1
             
             # Process text into chunks
             chunks = self._process_text(text)
             
             # Yield each chunk
             for chunk in chunks:
+                if self.max_samples is not None and chunk_count >= self.max_samples:
+                    return
+                    
                 yield {
                     'input_ids': chunk,
                     'labels': chunk.clone()  # For flow matching, labels are the same as input
                 }
-                sample_count += 1
-                
-                # Check max_samples for each chunk
-                if self.max_samples is not None and sample_count >= self.max_samples:
-                    return
+                chunk_count += 1
+        
+        print(f"Processed {sample_count} samples into {chunk_count} chunks")
 
 
 class MyDataCollator:
