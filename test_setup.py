@@ -262,6 +262,82 @@ def test_config_loading():
         if os.path.exists(temp_config_path):
             os.remove(temp_config_path)
 
+import torch
+import random
+import numpy as np
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.dataloader import default_collate
+
+def set_seed(seed=42):
+    """设置全局随机种子以确保可复现性"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # 如果使用多GPU
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42)
+def worker_init_fn(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+def test_dataset():
+    config_path = "config/trainingargs.yml"
+    if not os.path.exists(config_path):
+        print(f"Error: Config file {config_path} not found.")
+        return
+
+    try:
+        full_config = OmegaConf.load(config_path)
+    except Exception as e:
+        print(f"Error loading config: {e}")
+        return
+
+    # Force disable gradient checkpointing in config
+    if 'training_args' in full_config:
+        full_config.training_args.gradient_checkpointing = False
+
+    # Validate flow matching configuration
+    if 'trainer_args' in full_config:
+        if not FlowMatchingUtils.validate_config(dict(full_config.trainer_args)):
+            print("Invalid flow matching configuration. Please check the config file.")
+            return
+
+    # Setup tokenizer
+    dataset_config = full_config.get('dataset_config', {})
+    tokenizer_path = dataset_config.get('tokenizer_path', 'Tokenizer_32768_v1')
+
+    print(f"Loading tokenizer from {tokenizer_path}...")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+    except Exception as e:
+        print(f"Error loading tokenizer: {e}")
+        print("Please ensure the tokenizer path is correct.")
+        return
+
+    dataset_name = dataset_config.get('dataset_name', 'stanfordnlp/imdb')
+    chunk_size = dataset_config.get('chunk_size', 512)
+    max_eval_samples = dataset_config.get('max_eval_samples', 1000)
+
+    eval_dataset = MyDataset(
+        tokenizer_path=tokenizer_path,
+        dataset_name=dataset_name,
+        split="test",
+        chunk_size=chunk_size,
+        max_samples=max_eval_samples
+    )
+    dataloader = DataLoader(
+        eval_dataset,
+        batch_size=4,
+        num_workers=4,
+        worker_init_fn=worker_init_fn,
+        generator=torch.Generator().manual_seed(42)  # 从 v1.8 开始支持
+    )
+    for batch in dataloader:
+        print(batch['input_ids'][0][:10])
 
 def main():
     """Run all tests"""
@@ -307,4 +383,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # main()
+    test_dataset()

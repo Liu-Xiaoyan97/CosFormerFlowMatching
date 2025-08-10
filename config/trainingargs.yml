@@ -3,7 +3,7 @@ trainer_args:
   # Flow matching specific parameters
   scheduler_type: "polynomial"
   exponent: 2.0
-  loss_function: "generalized_kl"  # or "cross_entropy"
+  loss_function: "cross_entropy"  # "generalized_kl" or "cross_entropy"
   source_distribution: "mask"  # or "uniform"
   time_epsilon: 1e-3
 
@@ -11,40 +11,53 @@ trainer_args:
 training_args:
   output_dir: "./llm_cosformer_results"
   overwrite_output_dir: true
-  
+  max_steps: 1_000_000
   # Training parameters
   num_train_epochs: 50
   per_device_train_batch_size: 8  # Adjust based on your GPU memory
   per_device_eval_batch_size: 8
   gradient_accumulation_steps: 8  # Effective batch size = 8 * 8 = 64
-  max_steps: 1000000000
-  
+
   # Learning rate and optimization
   learning_rate: 5e-5
   weight_decay: 0.01
-  warmup_steps: 1000
+#  warmup_steps: 1000  # Number of warmup steps
+  warmup_ratio: 0.1  # Alternative: use 10% of total steps for warmup
   max_grad_norm: 1.0
-  
+
+  # Learning rate scheduler
+  lr_scheduler_type: "cosine"  # Options: "cosine", "linear", "constant", "polynomial", "constant_with_warmup"
+  # Note: "cosine_with_hard_restarts" is also available but less commonly used
+
+  # Optimizer settings
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1e-8
+
   # Evaluation and saving
   eval_strategy: "steps"
-  eval_steps: 1000
-  save_steps: 1000
+  eval_steps: 10_000
+  save_steps: 10_000
   save_total_limit: 3
   load_best_model_at_end: true
   metric_for_best_model: "eval_loss"
   greater_is_better: false
-  
+
   # Logging
   logging_steps: 100
   logging_dir: "./logs"
-  report_to: null  # Disable wandb/tensorboard by default
-  
+  report_to: "tensorboard"  # Use TensorBoard instead of wandb
+
   # Memory optimization
   fp16: false
   gradient_checkpointing: false  # Disabled for flow matching
   dataloader_pin_memory: true
   dataloader_num_workers: 2
-  
+
+  # Distributed training settings (IMPORTANT for multi-GPU)
+  ddp_find_unused_parameters: true  # Required for flow matching models
+  ddp_backend: "nccl"  # Use NCCL for better GPU communication
+
   # Other settings
   remove_unused_columns: false  # Important for flow matching
   prediction_loss_only: true
@@ -60,7 +73,7 @@ model_config:
   num_key_value_heads: 8
   max_position_embeddings: 4096
   attention_dropout: 0.1
-  
+
   # Flow matching specific parameters
   timestep_emb_dim: 256
   mlp_ratio: 4
@@ -68,11 +81,21 @@ model_config:
 # Dataset Configuration
 dataset_config:
   tokenizer_path: "Tokenizer_32768_v1"
-  # For HuggingFace datasets:
+
+  # SlimPajama-627B dataset configuration
+  # The dataset will automatically detect the structure based on the split:
+  # - train: /share/home/liuxiaoyan/cerebras/SlimPajama-627B/train/chunk*/
+  # - validation: /share/home/liuxiaoyan/cerebras/SlimPajama-627B/validation/chunk*/
+  # - test: /share/home/liuxiaoyan/cerebras/SlimPajama-627B/test/chunk*/
+  dataset_name: "/share/home/liuxiaoyan/cerebras/SlimPajama-627B"
+
+  # Alternative: For HuggingFace datasets
   # dataset_name: "stanfordnlp/imdb"
-  # For local datasets (uncomment and modify path):
-  dataset_name: "/Users/liuxiaoyan/Documents/papers/CosFormer-FlowMatching/stanfordnlp/imdb"
-  # dataset_name: "./my_local_dataset"  # Alternative local path
+
   chunk_size: 512
-  max_train_samples: null  # null for all samples, or set a number to limit
-  max_eval_samples: 1000
+
+  # Training uses all available data
+  max_train_samples: null  # null means use all samples
+
+  # Validation and test sets use limited samples for efficiency
+  max_eval_samples: 1000  # Limit validation/test to 1000 chunks
