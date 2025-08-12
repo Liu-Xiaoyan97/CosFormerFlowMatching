@@ -40,6 +40,12 @@ def modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
     return x * (1 + scale) + shift
 
 
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
 class LayerNorm(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -51,14 +57,41 @@ class LayerNorm(nn.Module):
             x = F.layer_norm(x.float(), [self.dim])
         return x * self.weight[None, None, :]
 
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`, *optional*):
+            Deprecated and unused.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    # cos = cos.unsqueeze(unsqueeze_dim)
+    # sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
 
 class TimestepEmbedder(nn.Module):
     """
-    Embeds scalar timesteps into vector representations.
+    改进版：更好的初始化和数值稳定性
     """
 
     def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
         super().__init__()
+        # 使用更保守的初始化
         self.mlp = nn.Sequential(
             nn.Linear(frequency_embedding_size, hidden_size, bias=True),
             nn.SiLU(),
@@ -66,35 +99,51 @@ class TimestepEmbedder(nn.Module):
         )
         self.frequency_embedding_size = frequency_embedding_size
 
+        # 改进的初始化策略
+        self._init_weights()
+
+    def _init_weights(self):
+        """使用更保守的初始化避免梯度爆炸"""
+        for module in self.mlp:
+            if isinstance(module, nn.Linear):
+                # 使用较小的初始化范围
+                std = 0.02  # 更小的标准差
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
     @staticmethod
     def timestep_embedding(time: Tensor, dim: int, max_period: int = 10000) -> Tensor:
-        """
-        Create sinusoidal timestep embeddings.
-        :param time: a 1-D Tensor of N indices, one per batch element.
-                          These may be fractional.
-        :param dim: the dimension of the output.
-        :param max_period: controls the minimum frequency of the embeddings.
-        :return: an (N, D) Tensor of positional embeddings.
-        """
+        """创建正弦时间嵌入，添加数值稳定性"""
         half = dim // 2
         freqs = torch.exp(
             -math.log(max_period)
             * torch.arange(start=0, end=half, dtype=torch.float32)
             / half
         ).to(device=time.device)
+
+        # 添加小的 epsilon 防止数值问题
         args = time[:, None].float() * freqs[None]
+
+        # 限制范围避免数值溢出
+        args = torch.clamp(args, -100, 100)
+
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
             embedding = torch.cat(
                 [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
             )
+
+        # 归一化以保持稳定的范围
+        embedding = embedding / math.sqrt(dim)
+
         return embedding
 
     def forward(self, time: Tensor) -> Tensor:
-        # Ensure time is detached to avoid gradient issues
-        time = time.detach()
         t_freq = self.timestep_embedding(time=time, dim=self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
+        # 添加 tanh 限制输出范围
+        t_emb = torch.tanh(t_emb)
         return t_emb
 
 
@@ -151,6 +200,7 @@ class CosformerAttention(nn.Module):
         key: Optional[Tensor] = None,
         value: Optional[Tensor] = None,
         attn_mask: Optional[Tensor] = None,
+        position_embeddings: Optional[Tensor] = None,
         eps: Optional[float] = 1e-6,
     ):
         """Input shape: Sequence x Batch x Embedding
@@ -168,7 +218,7 @@ class CosformerAttention(nn.Module):
             key = query
         if value is None:
             value = query
-        
+        cos, sin = position_embeddings
         num_heads = self.num_heads
         tgt_len, bsz, embed_dim = query.size()
         src_len = key.size(0)
@@ -193,7 +243,9 @@ class CosformerAttention(nn.Module):
         k = k.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
         # (N * h, S, d)
         v = v.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
-        
+
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
         # cos transform
         m = max(src_len, tgt_len)
         # get index - now using pre-computed buffer
@@ -280,75 +332,98 @@ class SmolLM3MLP(nn.Module):
         return down_proj
 
 
-class CosformerDDiTBlock(nn.Module):  # Removed GradientCheckpointingLayer inheritance
+class CosformerDDiTBlock(nn.Module):
     def __init__(self, config: "LLMFCosformerConfig", layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.n_heads = config.num_attention_heads
         self.cond_dim = config.flow_matching.get('cond_dim', config.hidden_size)
         self.dropout = config.attention_dropout
-        self.mlp_ratio = 4 
+        self.mlp_ratio = 4
         self.layer_idx = layer_idx
+
         self.norm1 = SmolLM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm2 = SmolLM3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_attn = CosformerAttention(config=config, layer_idx=layer_idx)
         self.mlp = SmolLM3MLP(config)
+
+        # AdaLN modulation with improved initialization
         self.adaLN_modulation = nn.Linear(self.cond_dim, 6 * self.hidden_size, bias=True)
-        nn.init.zeros_(self.adaLN_modulation.weight)
-        nn.init.zeros_(self.adaLN_modulation.bias)
+
+        # 关键：使用接近零的初始化，让模型开始时接近恒等变换
+        self._init_adaln()
+
+    def _init_adaln(self):
+        """初始化 AdaLN 使其开始时接近恒等变换"""
+        # 非常小的权重初始化
+        nn.init.normal_(self.adaLN_modulation.weight, mean=0.0, std=0.01)
+
+        # 偏置初始化很关键
+        with torch.no_grad():
+            # 将偏置分成6部分
+            bias = self.adaLN_modulation.bias.data
+            bias_chunks = bias.chunk(6)
+
+            # shift 部分初始化为0
+            bias_chunks[0].zero_()  # shift_msa
+            bias_chunks[3].zero_()  # shift_mlp
+
+            # scale 部分初始化为0（因为会加1）
+            bias_chunks[1].zero_()  # scale_msa
+            bias_chunks[4].zero_()  # scale_mlp
+
+            # gate 部分初始化为小值，逐层递增
+            gate_init = 0.1 + 0.05 * self.layer_idx  # 逐层递增的门控值
+            bias_chunks[2].fill_(gate_init)  # gate_msa
+            bias_chunks[5].fill_(gate_init)  # gate_mlp
 
     def forward(
-        self,
-        hidden_states: torch.Tensor, 
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        c: Optional[torch.Tensor] = None, 
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_value: Optional[Cache] = None,
+            use_cache: Optional[bool] = False,
+            cache_position: Optional[torch.LongTensor] = None,
+            position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+            c: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor]:
-        """
-            Forward pass for the Cosformer-based DDiT Block.
-
-            Args:
-                hidden_states (torch.Tensor): Input tensor of shape [B, S, D].
-                attention_mask (Optional[torch.Tensor]): Attention mask.
-                position_ids (Optional[torch.LongTensor]): Position IDs.
-                past_key_value (Optional[Cache]): Past key/value cache.
-                use_cache (Optional[bool]): Whether to use cache.
-                cache_position (Optional[torch.LongTensor]): Cache position.
-                position_embeddings (Optional[Tuple[torch.Tensor, torch.Tensor]]): Rotary position embeddings (not used here).
-                c (Optional[torch.Tensor]): Conditioning tensor of shape [B, Cond_Dim].
-
-            Returns:
-                Tuple[torch.Tensor]: Output tensor of shape [B, S, D].
-            """
-        batch_size, seq_len, _ = hidden_states.shape
         if c is None:
             raise ValueError("Conditioning tensor 'c' must be provided for CosformerDDiTBlock.")
 
-        # Ensure c is detached to avoid gradient accumulation issues
-        modulation_params = self.adaLN_modulation(c.detach())
+        # 应用 modulation
+        modulation_params = self.adaLN_modulation(c)
+
+        # 添加梯度裁剪以防止爆炸
+        modulation_params = torch.clamp(modulation_params, -10, 10)
+
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
             modulation_params.chunk(6, dim=1)
-        shift_msa = shift_msa.unsqueeze(1) # [B, 1, D]
-        scale_msa = scale_msa.unsqueeze(1) # [B, 1, D]
-        gate_msa = gate_msa.unsqueeze(1)   # [B, 1, D]
-        shift_mlp = shift_mlp.unsqueeze(1) # [B, 1, D]
-        scale_mlp = scale_mlp.unsqueeze(1) # [B, 1, D]
-        gate_mlp = gate_mlp.unsqueeze(1)   # [B, 1, D]
 
+        # 限制 scale 的范围
+        scale_msa = torch.tanh(scale_msa.unsqueeze(1) / 3) * 3  # 范围 [-3, 3]
+        scale_mlp = torch.tanh(scale_mlp.unsqueeze(1) / 3) * 3
+
+        # 限制 gate 的范围
+        gate_msa = torch.sigmoid(gate_msa.unsqueeze(1))  # 范围 [0, 1]
+        gate_mlp = torch.sigmoid(gate_mlp.unsqueeze(1))
+
+        shift_msa = shift_msa.unsqueeze(1)
+        shift_mlp = shift_mlp.unsqueeze(1)
+
+        # Self-attention block
         residual = hidden_states
-        hidden_states_normed = modulate(self.norm1(hidden_states), shift_msa, scale_msa) 
+        hidden_states_normed = modulate(self.norm1(hidden_states), shift_msa, scale_msa)
         hidden_states_normed_transposed = hidden_states_normed.transpose(0, 1)
         attn_output_transposed = self.self_attn(
             query=hidden_states_normed_transposed,
             key=hidden_states_normed_transposed,
             value=hidden_states_normed_transposed,
-            attn_mask=attention_mask, 
+            attn_mask=attention_mask,
+            position_embeddings=position_embeddings
         )
         attn_output = attn_output_transposed.transpose(0, 1)
+
         hidden_states = bias_dropout_add_scale(
             x=attn_output,
             scale=gate_msa,
@@ -356,18 +431,21 @@ class CosformerDDiTBlock(nn.Module):  # Removed GradientCheckpointingLayer inher
             prob=self.dropout,
             training=self.training,
         )
+
+        # MLP block
         residual = hidden_states
-        hidden_states_normed = modulate(self.norm2(hidden_states), shift_mlp, scale_mlp) 
+        hidden_states_normed = modulate(self.norm2(hidden_states), shift_mlp, scale_mlp)
         mlp_output = self.mlp(hidden_states_normed)
+
         hidden_states = bias_dropout_add_scale(
             x=mlp_output,
             scale=gate_mlp,
             residual=residual,
             prob=self.dropout,
             training=self.training,
-        ) 
-        return (hidden_states,)
+        )
 
+        return (hidden_states,)
 
 class SmolLM3RotaryEmbedding(nn.Module):
     """
@@ -408,57 +486,46 @@ class SmolLM3RotaryEmbedding(nn.Module):
 
 class DDitFinalLayer(nn.Module):
     def __init__(self, hidden_size: int, out_channels: int, cond_dim: int, rms_norm_eps: float = 1e-6):
-        """
-        Final layer for DDiT, adapted for CosformerDDiTBlock context.
-        Uses SmolLM3RMSNorm for consistency with the main model.
-
-        Args:
-            hidden_size (int): The dimension of the input hidden states (D).
-            out_channels (int): The number of output channels (e.g., vocab size).
-            cond_dim (int): The dimension of the conditioning signal (c). Should match
-                            the output dimension of TimestepEmbedder (often hidden_size).
-            rms_norm_eps (float): Epsilon for RMSNorm.
-        """
         super().__init__()
         self.hidden_size = hidden_size
         self.out_channels = out_channels
-        self.cond_dim = cond_dim # Store for clarity
+        self.cond_dim = cond_dim
 
-        # 使用与主干相同的 RMSNorm
         self.norm_final = SmolLM3RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.linear = nn.Linear(hidden_size, out_channels, bias=False)
-
-        # Adaptive Layer Normalization modulation
         self.adaLN_modulation = nn.Linear(cond_dim, 2 * hidden_size, bias=True)
-        nn.init.zeros_(self.adaLN_modulation.weight)
-        nn.init.zeros_(self.adaLN_modulation.bias)
-        nn.init.zeros_(self.linear.weight)
-        if self.linear.bias is not None:
-            nn.init.zeros_(self.linear.bias)
 
-    def forward(self, x: Tensor, c: Tensor) -> Tensor:
-        """
-        Forward pass for the final DDiT layer.
+        # 改进的初始化
+        self._init_weights()
 
-        Args:
-            x (Tensor): Input hidden states of shape [B, S, D].
-            c (Tensor): Conditioning signal of shape [B, Cond_Dim].
+    def _init_weights(self):
+        """初始化为接近恒等变换"""
+        nn.init.normal_(self.adaLN_modulation.weight, mean=0.0, std=0.01)
+        with torch.no_grad():
+            bias = self.adaLN_modulation.bias.data
+            shift_bias, scale_bias = bias.chunk(2)
+            shift_bias.zero_()  # shift 初始化为0
+            scale_bias.zero_()  # scale 初始化为0（因为会加1）
 
-        Returns:
-            Tensor: Output logits of shape [B, S, Out_Channels].
-        """
-        batch_size = x.shape[0]
-        # Detach c to avoid gradient issues
-        modulation_params = self.adaLN_modulation(c.detach())
-        shift, scale = modulation_params.chunk(2, dim=1) 
-        shift = shift.unsqueeze(1) # [B, 1, D]
-        scale = scale.unsqueeze(1) # [B, 1, D]
+    def forward(self, x: Tensor, c: Tensor, embedding_weight: Tensor, vocab_size: int) -> Tensor:
+        modulation_params = self.adaLN_modulation(c)
 
-        x_modulated = modulate(self.norm_final(x), shift, scale) # [B, S, D]
-        logits = self.linear(x_modulated) # [B, S, Out_Channels]
+        # 限制范围
+        modulation_params = torch.clamp(modulation_params, -10, 10)
+
+        shift, scale = modulation_params.chunk(2, dim=1)
+        shift = shift.unsqueeze(1)
+        scale = torch.tanh(scale.unsqueeze(1) / 3) * 3  # 限制 scale 范围
+
+        x_modulated = modulate(self.norm_final(x), shift, scale)
+
+        # 使用权重共享
+        output_weight = embedding_weight[:vocab_size, :]
+
+        # 添加温度缩放以控制初始预测的置信度
+        temperature = 1.0  # 可以作为超参数调整
+        logits = F.linear(x_modulated, output_weight) / temperature
 
         return logits
-
 
 class LLFMCosformerModelBase(PreTrainedModel):
     config_class = LLMFCosformerConfig
@@ -511,43 +578,50 @@ class LLFMCosformerForFlowMatching(LLFMCosformerModelBase, GenerationMixin):
         self.timestep_emb_dim = flow_config.get('timestep_emb_dim', 256)
         self.cond_dim = flow_config.get('cond_dim', config.hidden_size)
         self.flow_n_blocks = flow_config.get('n_blocks', 4)
-        self.flow_n_heads = flow_config.get('n_heads', config.num_attention_heads)
-        self.flow_mlp_ratio = flow_config.get('mlp_ratio', 4)
-        self.flow_dropout = flow_config.get('dropout', config.attention_dropout)
+
+        # 使用更保守的层归一化
+        self.preNorm = SmolLM3RMSNorm(config.hidden_size, eps=1e-5)  # 增大 eps
 
         self.time_embedding = TimestepEmbedder(
-            hidden_size=self.cond_dim, 
+            hidden_size=self.cond_dim,
             frequency_embedding_size=self.timestep_emb_dim
         )
-        
+
         add_token = 1 if masked else 0
         self.vocab_embed = nn.Embedding(self.vocab_size + add_token, config.hidden_size)
+
+        # 改进 embedding 初始化
+        self._init_embeddings()
+
         self.rotary_emb = SmolLM3RotaryEmbedding(config=config)
-        
+
         self.flow_blocks = nn.ModuleList([
             CosformerDDiTBlock(
                 config=config,
-                layer_idx=i, 
+                layer_idx=i,
             ) for i in range(self.flow_n_blocks)
         ])
 
         self.flow_output_layer = DDitFinalLayer(
             hidden_size=config.hidden_size,
-            out_channels=self.vocab_size, 
+            out_channels=self.vocab_size,
             cond_dim=self.cond_dim,
-            rms_norm_eps=config.rms_norm_eps, 
+            rms_norm_eps=config.rms_norm_eps
         )
 
-        # Disable gradient checkpointing
         self.gradient_checkpointing = False
-        
         self.post_init()
 
-    def get_input_embeddings(self):
-        return self.vocab_embed
+    def _init_embeddings(self):
+        """使用更小的初始化范围"""
+        # 使用较小的标准差
+        std = 0.02  # 而不是默认的 0.02 或更大
+        nn.init.normal_(self.vocab_embed.weight, mean=0.0, std=std)
 
-    def set_input_embeddings(self, value):
-        self.vocab_embed = value
+        # 如果有 padding_idx，将其设为零
+        if self.vocab_embed.padding_idx is not None:
+            with torch.no_grad():
+                self.vocab_embed.weight[self.vocab_embed.padding_idx].fill_(0)
 
     def forward(
         self,
@@ -559,7 +633,7 @@ class LLFMCosformerForFlowMatching(LLFMCosformerModelBase, GenerationMixin):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        timesteps: Optional[torch.FloatTensor] = None, 
+        timesteps: Optional[torch.FloatTensor] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         **kwargs
@@ -567,20 +641,21 @@ class LLFMCosformerForFlowMatching(LLFMCosformerModelBase, GenerationMixin):
 
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        
+
         # Input validation
         if (input_ids is None) and (inputs_embeds is None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-        
+
         if timesteps is None:
             raise ValueError("timesteps must be provided for flow matching forward pass.")
 
-        # Ensure timesteps are detached
-        timesteps = timesteps.detach() if timesteps.requires_grad else timesteps
+        # 归一化 timesteps 到 [0, 1] 范围
+        timesteps = torch.clamp(timesteps, 0, 1)
 
-        # Get embeddings
-        if inputs_embeds is None:
+        if input_ids is not None:
             inputs_embeds = self.vocab_embed(input_ids)
+        else:
+            inputs_embeds = kwargs.get('inputs_embeds')
 
         # Cache setup
         if use_cache and past_key_values is None:
@@ -596,53 +671,28 @@ class LLFMCosformerForFlowMatching(LLFMCosformerModelBase, GenerationMixin):
         # Main forward pass
         hidden_states = inputs_embeds
         all_hidden_states = () if output_hidden_states else None
-        
+
         # Position embeddings with no_grad to avoid gradient issues
         with torch.no_grad():
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        # Timestep conditioning - ensure it's computed fresh
+        hidden_states = self.preNorm(hidden_states)
+        # 计算时间嵌入
         c = self.time_embedding(timesteps.float())
-        # Stop gradients from flowing back through c
-        c = c.detach()
-
-        # Process through flow blocks
+        # 通过所有块
         for block in self.flow_blocks:
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-                
             hidden_states, = block(
                 hidden_states,
-                attention_mask=attention_mask,
                 c=c,
                 position_embeddings=position_embeddings,
-                position_ids=position_ids, 
-                past_key_value=None, 
-                use_cache=False, 
-                cache_position=None
             )
 
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
-
-        # Final output layer
-        logits = self.flow_output_layer(x=hidden_states, c=c) # Shape: (B, S, Vocab_Size)
-        
-        loss = None
-        if labels is not None:
-            # For flow matching, we typically don't compute standard cross-entropy loss here
-            # The loss computation should be handled by the flow matching loss function
-            pass
-
-        if not return_dict:
-            outputs = (logits,)
-            if output_hidden_states:
-                outputs += (all_hidden_states,)
-            return ((loss,) + outputs) if loss is not None else outputs
-
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=past_key_values,
-            hidden_states=all_hidden_states,
+        # 最终输出
+        logits = self.flow_output_layer(
+            x=hidden_states,
+            c=c,
+            embedding_weight=self.vocab_embed.weight,
+            vocab_size=self.vocab_size
         )
+
+        return CausalLMOutputWithPast(logits=logits)

@@ -1,6 +1,6 @@
 import torch
 import os
-from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
+from transformers import AutoTokenizer, set_seed
 from CosFormer.configuration_LLMFCosformer import LLMFCosformerConfig
 from CosFormer.cosformer import LLFMCosformerForFlowMatching
 from utils import (
@@ -18,7 +18,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def main():
     """Main training function"""
-
+    set_seed(42)
     # Load configuration
     config_path = "config/trainingargs.yml"
     if not os.path.exists(config_path):

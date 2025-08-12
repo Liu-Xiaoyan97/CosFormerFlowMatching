@@ -1391,8 +1391,8 @@ def load_training_args_from_yaml(yaml_path: str) -> TrainingArguments:
         'save_total_limit': 3,
         'learning_rate': 5e-5,
         'weight_decay': 0.01,
-        'warmup_steps': 500,
-        'warmup_ratio': 0.0,  # Can use ratio instead of steps
+        'warmup_steps': 0,
+        'warmup_ratio': 0.1,  # Can use ratio instead of steps
         'lr_scheduler_type': 'cosine',  # Default to cosine with warmup
         'logging_steps': 100,
         'logging_dir': './logs',
