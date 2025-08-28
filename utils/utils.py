@@ -412,7 +412,7 @@ def prefix_tokens_with_noise(
         max_seq_len: int,
         tokenizer: PreTrainedTokenizer
     ) -> torch.Tensor:
-    noise_tokens = torch.empty(1, max_seq_len)
+    noise_tokens = torch.full((1, max_seq_len), -100)
     for prompt in prompts:
         prefix_tokens = tokenizer.encode(prompt, add_special_tokens=False, return_tensors='pt')
         noise = source_distribution.sample(
@@ -430,7 +430,9 @@ def prefix_tokens_with_noise(
             ],
             dim=0
         )
-    return noise_tokens.long()
+    return noise_tokens[1:].long()
+
+
 class WrappedModel(ModelWrapper):
     def forward(self, x: torch.Tensor, t: torch.Tensor, **kwargs):
         logits = self.model.forward(input_ids=x, timesteps=t).logits

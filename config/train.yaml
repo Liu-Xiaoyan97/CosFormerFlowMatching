@@ -1,9 +1,9 @@
 dataset:
-  name: "stanfordnlp/imdb"
-  batch_size: 2
+  name: "/share/home/liuxiaoyan/cerebras/SlimPajama-627B"
+  batch_size: 64
   pin_memory: true
-  num_workers: 2
-  chunk_size: 128
+  num_workers: 4
+  chunk_size: 512
   tokenizer: 'Tokenizer_32768_v1'
   seed: 42
 
@@ -30,7 +30,7 @@ evaluation:
   max_eval_samples: 1000
   eval_strategy: "steps"
   output_dir: "output_dir/"
-  perplexity_steps: &eval_steps 10
+  perplexity_steps: &eval_steps 1000
   eval_steps: *eval_steps
   save_steps: *eval_steps
   save_total_limit: 3

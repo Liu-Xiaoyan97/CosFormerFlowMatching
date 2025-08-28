@@ -254,10 +254,10 @@ class LLMFCosformerForCausalLM(LLFMCosformerPreTrainedModel):
         
         logits = self.lm_head(hidden_states)
 
-        loss_2 = F.cross_entropy(logits.view(-1, logits.size(-1)), x_1.view(-1), reduction="mean")
+        loss_2 = F.cross_entropy(logits.view(-1, logits.size(-1)), x_1.view(-1), reduction="mean", ignore_index=-100)
 
         if self.config.loss_function == "cross_entropy":
-            loss_1 = F.cross_entropy(logits.view(-1, logits.size(-1)), x_1.view(-1), reduction="mean")
+            loss_1 = F.cross_entropy(logits.view(-1, logits.size(-1)), x_1.view(-1), reduction="mean", ignore_index=-100)
         elif self.config.loss_function == "generalized_kl":
             loss_1 = self.loss_fn(logits=logits, x_1=x_1, x_t=x_t, t=t).mean()
             loss_1 = torch.clamp(loss_1, max=10.0)
