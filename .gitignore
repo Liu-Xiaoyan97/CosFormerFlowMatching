@@ -119,9 +119,8 @@ ENV/
 cython_debug/
 
 # 训练日志
-llm_cosformer_results/
-logs/
-wandb/
+outputs/
+output_dir/
 
 # 数据
 stanfordnlp/

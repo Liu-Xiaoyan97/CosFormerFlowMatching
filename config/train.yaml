@@ -1,0 +1,39 @@
+dataset:
+  name: "stanfordnlp/imdb"
+  batch_size: 2
+  pin_memory: true
+  num_workers: 2
+  chunk_size: 128
+  tokenizer: 'Tokenizer_32768_v1'
+  seed: 42
+
+train:
+  logging_steps: 100
+  num_train_epochs: 3
+  max_steps: &max_steps 1_000_000_000
+  gradient_accumulation_steps: 8
+  max_train_samples: 100000
+  max_grad_norm: 1.0
+
+optimizer:
+  lr: 1e-3  # 降低学习率，从1e-2到1e-3
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1e-8
+
+scheduler:
+  warmup_steps: 100  # 增加warmup_steps
+  warmup_ratio: 0.1
+  num_training_steps: *max_steps
+
+evaluation:
+  max_eval_samples: 1000
+  eval_strategy: "steps"
+  output_dir: "output_dir/"
+  perplexity_steps: &eval_steps 10
+  eval_steps: *eval_steps
+  save_steps: *eval_steps
+  save_total_limit: 3
+  metric_for_best_model: "eval_loss"
+
+

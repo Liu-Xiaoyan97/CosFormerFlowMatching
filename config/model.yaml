@@ -1,0 +1,22 @@
+vocab_size: 32768
+hidden_size: &hidden_size 128
+num_hidden_layers: 2
+num_attention_heads: 4
+intermediate_size: 256
+max_position_embeddings: 512
+max_position_seq: 1024
+rms_norm_eps: 1e-6
+kv_rope_head_dim: 32
+hidden_act: 'silu'
+attention_bias: False
+attention_dropout: 0.0
+base: 10000
+scale: 1.0
+time_embedding_dim: *hidden_size
+flow:
+  scheduler_type: "polynomial"
+  exponent: 2.0
+  loss_function: "generalized_kl" # "generalized_kl" or "cross_entropy"
+  source_distribution: "uniform" # "mask" or  "uniform"
+  time_epsilon: 1e-3
+  sde_t: 1.0
