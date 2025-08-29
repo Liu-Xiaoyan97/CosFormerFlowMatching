@@ -413,8 +413,11 @@ def prefix_tokens_with_noise(
         tokenizer: PreTrainedTokenizer
     ) -> torch.Tensor:
     noise_tokens = torch.full((1, max_seq_len), -100)
+    attention_mask = torch.zeros((1, max_seq_len))
     for prompt in prompts:
         prefix_tokens = tokenizer.encode(prompt, add_special_tokens=False, return_tensors='pt')
+        mask = torch.zeros((1, max_seq_len))
+        mask[:, prefix_tokens.size(-1):] = 1
         noise = source_distribution.sample(
             tensor_size=(1, max_seq_len-prefix_tokens.size(-1)),
             device=prefix_tokens.device
@@ -430,7 +433,14 @@ def prefix_tokens_with_noise(
             ],
             dim=0
         )
-    return noise_tokens[1:].long()
+        attention_mask = torch.cat(
+            [
+                attention_mask,
+                mask
+            ],
+            dim=0
+        )
+    return (noise_tokens[1:].long(), attention_mask[1:].long())
 
 
 class WrappedModel(ModelWrapper):
@@ -456,7 +466,7 @@ def generate(
         path=path,
         vocabulary_size=vocab_size
     )
-    x_init = prefix_tokens_with_noise(
+    x_init, attention_mask = prefix_tokens_with_noise(
         source_distribution,
         prompts,
         seq_len,
@@ -470,6 +480,7 @@ def generate(
         dtype_sample=torch.float32,
         time_grid=torch.tensor([0.0, 1.0-time_epsilon]),
     )
+    sample = torch.where(attention_mask == 1, sample, x_init)
     sentences = tokenizer.batch_decode(sample)
     if save_dir is not None:
         file_name = save_dir / f"iter_{step}.txt"
@@ -478,7 +489,7 @@ def generate(
         with open(file_name, "w") as file:
             for sentence in sentences:
                 file.write(f"{sentence}\n{'=' * 20} New sample {'=' * 20}\n")
-    return sample
+    return sample, sentences
 
 __all__ = [
     'CosformerDataset',

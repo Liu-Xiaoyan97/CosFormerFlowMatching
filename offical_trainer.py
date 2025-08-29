@@ -2,6 +2,7 @@ import torch
 from pathlib import Path
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm   
 from CosFormer import LLMFCosformerForCausalLM, LLMFCosformerConfig
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
@@ -39,6 +40,10 @@ def train(model, train_loader, eval_loader, optimizer, scheduler, tokenizer, con
     total_steps = 0
     avg_eval_loss = None
     avg_eval_ppl = None
+    
+    # 初始化TensorBoard writer
+    writer = SummaryWriter(log_dir=config.evaluation.output_dir)
+    
     while total_steps < config.train.max_steps:
         progress_bar = tqdm(train_loader, desc=f"Training")
         for batch in progress_bar:
@@ -63,6 +68,16 @@ def train(model, train_loader, eval_loader, optimizer, scheduler, tokenizer, con
             train_ppl = torch.exp(loss_2).item()
             optimizer.step()
             scheduler.step()
+            
+            if total_steps % config.train.logging_steps == 0:
+                writer.add_scalar('Train/Loss_1', loss_1.item(), total_steps)
+                writer.add_scalar('Train/Loss_2', loss_2.item(), total_steps)
+                writer.add_scalar('Train/Total_Loss', loss.item(), total_steps)
+                writer.add_scalar('Train/Perplexity', train_ppl, total_steps)
+                writer.add_scalar('Train/Param_Norm', param_norm, total_steps)
+                writer.add_scalar('Train/Grad_Norm', grad_norm, total_steps)
+                if scheduler.get_last_lr():
+                    writer.add_scalar('Train/Learning_Rate', scheduler.get_last_lr()[0], total_steps)
 
             progress_bar.set_postfix({
                 "loss_1": f"{loss_1.item():.4f}",
@@ -89,13 +104,18 @@ def train(model, train_loader, eval_loader, optimizer, scheduler, tokenizer, con
                     total_eval_loss += batch_eval_loss.item()
                     total_eval_ppl += eval_ppl.item()
                     eval_steps += 1
+                    
                 avg_eval_loss = total_eval_loss / eval_steps
                 avg_eval_ppl = total_eval_ppl / eval_steps
+                
+                if total_steps % config.train.logging_steps == 0:
+                    writer.add_scalar('Eval/Loss', avg_eval_loss, total_steps)
+                    writer.add_scalar('Eval/Perplexity', avg_eval_ppl, total_steps)
 
             if total_steps % config.evaluation.perplexity_steps == 0:
                 model.eval()
                 wrapped_model = WrappedModel(model)
-                samples = generate(
+                samples, sentences = generate(
                     model=wrapped_model,
                     prompts=["hello", "how are", "give me you"],
                     step=total_steps,
@@ -114,6 +134,15 @@ def train(model, train_loader, eval_loader, optimizer, scheduler, tokenizer, con
                     time_epsilon=0.0,
                     save_dir=Path("outputs/")
                 )
+                
+                # 记录生成文本示例到TensorBoard
+                for i, sentence in enumerate(sentences):
+                    writer.add_text(f'Generated_Text/Sample_{i}', sentence, total_steps)
+                
+                model.train()
+    
+    # 关闭writer
+    writer.close()
 
 
 @hydra.main(version_base=None, config_path="./config", config_name="train.yaml")
